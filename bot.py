@@ -16,17 +16,12 @@ from database import init_db, DB_NAME
 from utils import owner_rate, intermediary_rate, deduct_from_inventory
 import os
 
-TOKEN = os.getenv("8529710957:AAEKVks31ctycVxJZAUPE40sPCOo-YSr7z0")
-OWNER_ID = int(os.getenv("347546519", "0"))
-INTERMEDIARY_ID = int(os.getenv("347546519", "0"))
+TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+INTERMEDIARY_ID = int(os.getenv("INTERMEDIARY_ID", "0"))
 
 if not TOKEN or OWNER_ID == 0:
     raise ValueError("Missing required environment variables!")
-
-# ------------------ CONFIGURATION ------------------
-TOKEN = "8529710957:AAEKVks31ctycVxJZAUPE40sPCOo-YSr7z0"      # Replace with your bot token
-OWNER_ID = 347546519                # Replace with your Telegram user ID
-INTERMEDIARY_ID = 347546519          # Replace with partner's ID (or same for testing)
 # ----------------------------------------------------
 
 # Enable logging (fixed the typo)

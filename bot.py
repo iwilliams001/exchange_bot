@@ -16,6 +16,11 @@ from database import init_db, DB_NAME
 from utils import owner_rate, intermediary_rate, deduct_from_inventory
 import os
 
+print("Environment variables available:", list(os.environ.keys()))
+print("BOT_TOKEN present:", "BOT_TOKEN" in os.environ)
+print("OWNER_ID present:", "OWNER_ID" in os.environ)
+print("INTERMEDIARY_ID present:", "INTERMEDIARY_ID" in os.environ)
+
 TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 INTERMEDIARY_ID = int(os.getenv("INTERMEDIARY_ID", "0"))

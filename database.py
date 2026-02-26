@@ -1,6 +1,16 @@
 import sqlite3
 
-DB_NAME = "exchange_bot.db"
+import os
+
+# Determine the database path - use Railway volume if available, otherwise local
+if os.path.exists('/data') or os.getenv('RAILWAY_VOLUME_MOUNT_PATH'):
+    # We're on Railway with a volume mounted
+    DB_PATH = '/data/exchange_bot.db'
+else:
+    # Local development
+    DB_PATH = 'exchange_bot.db'
+
+DB_NAME = DB_PATH
 
 
 def init_db():

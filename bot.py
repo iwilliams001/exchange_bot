@@ -42,8 +42,7 @@ SET_MARKET_RATE = 3   # for set market conversation
 
 # ------------------ Helper: Main Menu Keyboard ------------------
 def get_main_menu_keyboard(user_id):
-    buttons = []
-    if user_id == OWNER_ID:
+    if user_id in (OWNER_ID, INTERMEDIARY_ID):
         buttons = [
             [InlineKeyboardButton("💰 Set Market Rate", callback_data="menu_setmarket")],
             [InlineKeyboardButton("📦 Bulk Transfer", callback_data="menu_bulktransfer")],
@@ -52,17 +51,10 @@ def get_main_menu_keyboard(user_id):
             [InlineKeyboardButton("📉 Current Rates", callback_data="menu_currentrates")],
             [InlineKeyboardButton("💸 Pay Customer", callback_data="menu_paycustomer")],
         ]
-    elif user_id == INTERMEDIARY_ID:
-        buttons = [
-            [InlineKeyboardButton("💸 Pay Customer", callback_data="menu_paycustomer")],
-            [InlineKeyboardButton("📊 Inventory", callback_data="menu_inventory")],
-            [InlineKeyboardButton("📉 Current Rates", callback_data="menu_currentrates")],
-        ]
+        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="menu_cancel")])
+        return InlineKeyboardMarkup(buttons)
     else:
-        # Unauthorized user – no buttons
-        return None
-    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="menu_cancel")])
-    return InlineKeyboardMarkup(buttons)
+        return None  # Unauthorized
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text="Main Menu:"):
     """Sends the main menu as a new message (or edits if called from callback)."""
@@ -88,7 +80,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------ Set Market Rate Conversation ------------------
 async def setmarket_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
-    if user_id != OWNER_ID:
+    if user_id not in (OWNER_ID, INTERMEDIARY_ID):
         if isinstance(update, Update) and update.callback_query:
             await update.callback_query.edit_message_text("Only owner can set market rate.")
         else:
@@ -129,7 +121,7 @@ async def bulk_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.edit_message_text("Enter USD amount sent:")
     else:
         user_id = update.effective_user.id
-        if user_id != OWNER_ID:
+        if user_id not in (OWNER_ID, INTERMEDIARY_ID):
             await update.message.reply_text("Only owner can record bulk transfers.")
             return ConversationHandler.END
         await update.message.reply_text("Enter USD amount sent:")
@@ -195,10 +187,12 @@ async def pay_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Enter USD amount received from customer:")
     return USD_AMOUNT
 
+
 async def pay_usd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         usd = float(update.message.text)
         context.user_data['usd_received'] = usd
+
         # Get latest market rate
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
@@ -208,20 +202,30 @@ async def pay_usd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not row:
             await update.message.reply_text("No market rate set. Owner must set rate first.")
             return ConversationHandler.END
+
         market = row[0]
         owner = owner_rate(market)
-        suggested = usd * owner
+        inter = intermediary_rate(market)  # <-- new: calculate intermediary rate
+        suggested = usd * inter  # <-- changed: use intermediary rate
+
+        # Store everything needed for later
         context.user_data['market'] = market
         context.user_data['owner_rate'] = owner
+        context.user_data['intermediary_rate'] = inter
         context.user_data['suggested'] = suggested
+
         keyboard = [
             [InlineKeyboardButton("✅ Use suggested", callback_data='use_suggested'),
              InlineKeyboardButton("✏️ Enter different", callback_data='enter_different')],
             [InlineKeyboardButton("❌ Cancel", callback_data='cancel_transaction')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(f"Suggested GHS amount: {suggested:.2f}\nWhat do you want to do?",
-                                        reply_markup=reply_markup)
+        await update.message.reply_text(
+            f"Suggested GHS amount (using intermediary's rate): {suggested:.2f}\n"
+            f"Owner rate: {owner:.4f} GHS/USD | Intermediary rate: {inter:.4f} GHS/USD\n"
+            "What do you want to do?",
+            reply_markup=reply_markup
+        )
         return CONFIRM_SUGGESTION
     except ValueError:
         await update.message.reply_text("Please enter a valid number.")
@@ -265,6 +269,7 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
     suggested = context.user_data['suggested']
     market = context.user_data['market']
     owner = context.user_data['owner_rate']
+    inter = context.user_data['intermediary_rate']
 
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
@@ -294,7 +299,7 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
                  (usd_received, suggested_ghs, actual_ghs_paid, market_rate_at_time,
                   owner_rate_at_time, intermediary_rate_at_time, date, recorded_by)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-              (usd, suggested, actual, market, owner, intermediary_rate(market),
+              (usd, suggested, actual, market, owner, inter,
                datetime.now().isoformat(), user_id))
     tx_id = c.lastrowid
 
@@ -376,15 +381,17 @@ async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------ Profit Summary ------------------
 async def profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
-    if user_id != OWNER_ID:
+    if user_id not in (OWNER_ID, INTERMEDIARY_ID):
         if isinstance(update, Update) and update.callback_query:
-            await update.callback_query.edit_message_text("Only owner can view profit.")
+            await update.callback_query.edit_message_text("Unauthorized.")
         else:
-            await update.message.reply_text("Only owner can view profit.")
+            await update.message.reply_text("Unauthorized.")
         return
 
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
+
+    # --- Owner profit in USD (existing complex query) ---
     c.execute('''
         SELECT SUM(t.usd_received - ub.total_cost)
         FROM customer_transactions t
@@ -395,20 +402,32 @@ async def profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             GROUP BY tx_id
         ) ub ON t.id = ub.tx_id
     ''')
-    total_profit = c.fetchone()[0] or 0.0
+    owner_profit_usd = c.fetchone()[0] or 0.0
+
+    # --- Intermediary profit in GHS (new calculation) ---
+    # Formula: for each transaction, (USD received × market rate) - actual GHS paid
+    c.execute('''
+        SELECT SUM(usd_received * market_rate_at_time - actual_ghs_paid)
+        FROM customer_transactions
+    ''')
+    intermediary_profit_ghs = c.fetchone()[0] or 0.0
+
     conn.close()
 
-    text = f"💰 Total owner profit (USD): ${total_profit:.2f}"
+    text = (
+        f"💰 **Owner profit (USD):** ${owner_profit_usd:.2f}\n"
+        f"💸 **Intermediary profit (GHS):** {intermediary_profit_ghs:.2f} GHS"
+    )
 
     if isinstance(update, Update) and update.callback_query:
-        await update.callback_query.edit_message_text(text)
+        await update.callback_query.edit_message_text(text, parse_mode='Markdown')
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="Main Menu:",
             reply_markup=get_main_menu_keyboard(user_id)
         )
     else:
-        await update.message.reply_text(text)
+        await update.message.reply_text(text, parse_mode='Markdown')
         await show_main_menu(update, context, "Main Menu:")
 
 # ------------------ Current Rates ------------------

@@ -1,4 +1,13 @@
 import logging
+import sqlite3
+import csv
+from io import StringIO
+from datetime import datetime
+import os
+import httpx
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -9,27 +18,19 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes
 )
-import sqlite3
-from datetime import datetime
 
 from database import init_db, DB_NAME
 from utils import owner_rate, intermediary_rate, deduct_from_inventory
-import os
 
-print("Environment variables available:", list(os.environ.keys()))
-print("BOT_TOKEN present:", "BOT_TOKEN" in os.environ)
-print("OWNER_ID present:", "OWNER_ID" in os.environ)
-print("INTERMEDIARY_ID present:", "INTERMEDIARY_ID" in os.environ)
-
+# ------------------ CONFIGURATION ------------------
 TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 INTERMEDIARY_ID = int(os.getenv("INTERMEDIARY_ID", "0"))
 
 if not TOKEN or OWNER_ID == 0:
     raise ValueError("Missing required environment variables!")
-# ----------------------------------------------------
 
-# Enable logging (fixed the typo)
+# Enable logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -38,10 +39,14 @@ logger = logging.getLogger(__name__)
 
 # Conversation states
 (USD_AMOUNT, CONFIRM_SUGGESTION, ACTUAL_AMOUNT) = range(3)
-SET_MARKET_RATE = 3   # for set market conversation
+SET_MARKET_RATE = 3
+
+# Scheduler for auto‑fetching market rate
+scheduler = AsyncIOScheduler()
 
 # ------------------ Helper: Main Menu Keyboard ------------------
 def get_main_menu_keyboard(user_id):
+    """Return inline keyboard with all actions for authorized users."""
     if user_id in (OWNER_ID, INTERMEDIARY_ID):
         buttons = [
             [InlineKeyboardButton("💰 Set Market Rate", callback_data="menu_setmarket")],
@@ -50,21 +55,26 @@ def get_main_menu_keyboard(user_id):
             [InlineKeyboardButton("📈 Profit", callback_data="menu_profit")],
             [InlineKeyboardButton("📉 Current Rates", callback_data="menu_currentrates")],
             [InlineKeyboardButton("💸 Pay Customer", callback_data="menu_paycustomer")],
+            [InlineKeyboardButton("📤 Export CSV", callback_data="menu_export")],
+            [InlineKeyboardButton("📋 List Transactions", callback_data="menu_listtx")],
+            [InlineKeyboardButton("🔍 Audit Log", callback_data="menu_audit")],
         ]
+        # Owner-only sensitive actions
+        if user_id == OWNER_ID:
+            buttons.append([InlineKeyboardButton("🗑️ Delete Transaction", callback_data="menu_deletetx")])
+            buttons.append([InlineKeyboardButton("🔄 Reset Database", callback_data="menu_resetdb")])
         buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="menu_cancel")])
         return InlineKeyboardMarkup(buttons)
-    else:
-        return None  # Unauthorized
+    return None
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text="Main Menu:"):
-    """Sends the main menu as a new message (or edits if called from callback)."""
+    """Send or edit a message with the main menu."""
     user_id = update.effective_user.id
     keyboard = get_main_menu_keyboard(user_id)
     if keyboard is None:
         await (update.callback_query.edit_message_text("Unauthorized.") if update.callback_query else update.message.reply_text("Unauthorized."))
         return
     if update.callback_query:
-        # Edit the current message (which might be a result) to show the menu
         await update.callback_query.edit_message_text(text, reply_markup=keyboard)
     else:
         await update.message.reply_text(text, reply_markup=keyboard)
@@ -77,14 +87,42 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await show_main_menu(update, context, "Welcome! Choose an action:")
 
+# ------------------ Automatic Market Rate Fetching ------------------
+async def fetch_market_rate():
+    """Fetch USD/GHS rate from a free API and store it."""
+    try:
+        # Using exchangerate-api.com (free, no key)
+        async with httpx.AsyncClient() as client:
+            response = await client.get("https://api.exchangerate-api.com/v4/latest/USD")
+            data = response.json()
+            rate = data['rates']['GHS']
+            conn = sqlite3.connect(DB_NAME)
+            c = conn.cursor()
+            c.execute("INSERT INTO market_rates (rate, timestamp, entered_by) VALUES (?, ?, ?)",
+                      (rate, datetime.now().isoformat(), 0))  # 0 = system
+            conn.commit()
+            conn.close()
+            logger.info(f"Auto-fetched market rate: {rate}")
+    except Exception as e:
+        logger.error(f"Failed to fetch market rate: {e}")
+
+async def fetch_rate_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual command to trigger rate fetch."""
+    user_id = update.effective_user.id
+    if user_id not in (OWNER_ID, INTERMEDIARY_ID):
+        return
+    await fetch_market_rate()
+    await update.message.reply_text("Market rate fetched and stored.")
+    await show_main_menu(update, context, "Main Menu:")
+
 # ------------------ Set Market Rate Conversation ------------------
 async def setmarket_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
     if user_id not in (OWNER_ID, INTERMEDIARY_ID):
         if isinstance(update, Update) and update.callback_query:
-            await update.callback_query.edit_message_text("Only owner can set market rate.")
+            await update.callback_query.edit_message_text("Unauthorized.")
         else:
-            await update.message.reply_text("Only owner can set market rate.")
+            await update.message.reply_text("Unauthorized.")
         return ConversationHandler.END
 
     if isinstance(update, Update) and update.callback_query:
@@ -104,7 +142,6 @@ async def setmarket_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
         await update.message.reply_text(f"Market rate set to {rate}")
-        # Return to main menu
         await show_main_menu(update, context, "Main Menu:")
     except ValueError:
         await update.message.reply_text("Invalid number. Please enter a valid rate.")
@@ -115,14 +152,14 @@ async def setmarket_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bulk_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(update, Update) and update.callback_query:
         user_id = update.callback_query.from_user.id
-        if user_id != OWNER_ID:
-            await update.callback_query.edit_message_text("Only owner can record bulk transfers.")
+        if user_id not in (OWNER_ID, INTERMEDIARY_ID):
+            await update.callback_query.edit_message_text("Unauthorized.")
             return ConversationHandler.END
         await update.callback_query.edit_message_text("Enter USD amount sent:")
     else:
         user_id = update.effective_user.id
         if user_id not in (OWNER_ID, INTERMEDIARY_ID):
-            await update.message.reply_text("Only owner can record bulk transfers.")
+            await update.message.reply_text("Unauthorized.")
             return ConversationHandler.END
         await update.message.reply_text("Enter USD amount sent:")
     return "BULK_USD"
@@ -187,12 +224,10 @@ async def pay_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Enter USD amount received from customer:")
     return USD_AMOUNT
 
-
 async def pay_usd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         usd = float(update.message.text)
         context.user_data['usd_received'] = usd
-
         # Get latest market rate
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
@@ -202,18 +237,14 @@ async def pay_usd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not row:
             await update.message.reply_text("No market rate set. Owner must set rate first.")
             return ConversationHandler.END
-
         market = row[0]
         owner = owner_rate(market)
-        inter = intermediary_rate(market)  # <-- new: calculate intermediary rate
-        suggested = usd * inter  # <-- changed: use intermediary rate
-
-        # Store everything needed for later
+        inter = intermediary_rate(market)
+        suggested = usd * inter  # Use intermediary's rate for suggestion
         context.user_data['market'] = market
         context.user_data['owner_rate'] = owner
         context.user_data['intermediary_rate'] = inter
         context.user_data['suggested'] = suggested
-
         keyboard = [
             [InlineKeyboardButton("✅ Use suggested", callback_data='use_suggested'),
              InlineKeyboardButton("✏️ Enter different", callback_data='enter_different')],
@@ -258,11 +289,9 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
     if isinstance(update_or_query, Update):
         user_id = update_or_query.effective_user.id
         message = update_or_query.message
-        is_callback = False
     else:
         user_id = update_or_query.from_user.id
         message = update_or_query.message
-        is_callback = True
 
     usd = context.user_data['usd_received']
     actual = context.user_data['actual_ghs']
@@ -290,11 +319,9 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
     owner_profit = usd - total_cost_usd
     if owner_profit < 0:
         await message.reply_text(f"This transaction would result in negative owner profit (${owner_profit:.2f}). Not allowed. Transaction cancelled.")
-        # Note: inventory deduction already happened – in production you'd roll back.
         await show_main_menu(update_or_query, context, "Main Menu:")
         return ConversationHandler.END
 
-    c = conn.cursor()
     c.execute('''INSERT INTO customer_transactions
                  (usd_received, suggested_ghs, actual_ghs_paid, market_rate_at_time,
                   owner_rate_at_time, intermediary_rate_at_time, date, recorded_by)
@@ -320,7 +347,7 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
         f"Remaining GHS: {remaining:.2f}"
     )
 
-    # Notify owner if the transaction was performed by someone else (intermediary)
+    # Notify owner if intermediary performed transaction
     if user_id != OWNER_ID:
         try:
             await context.bot.send_message(
@@ -329,13 +356,22 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
                     f"🔔 Intermediary recorded a transaction:\n"
                     f"USD: {usd}\n"
                     f"GHS paid: {actual:.2f}\n"
-                    f"Suggested: {suggested:.2f}\n"
-                    f"Owner profit: ${owner_profit:.2f}\n"
-                    f"Remaining GHS: {remaining:.2f}"
+                    f"Owner profit: ${owner_profit:.2f}"
                 )
             )
         except Exception as e:
             logger.error(f"Failed to notify owner: {e}")
+
+    # Low inventory alert
+    if remaining < 1000:  # threshold
+        for uid in (OWNER_ID, INTERMEDIARY_ID):
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=f"⚠️ Low GHS balance: only {remaining:.2f} GHS left. Consider a top-up."
+                )
+            except Exception as e:
+                logger.error(f"Failed to alert user {uid}: {e}")
 
     await show_main_menu(update_or_query, context, "Main Menu:")
     return ConversationHandler.END
@@ -368,7 +404,6 @@ async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if isinstance(update, Update) and update.callback_query:
         await update.callback_query.edit_message_text(text)
-        # Send a new message with main menu
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="Main Menu:",
@@ -378,7 +413,7 @@ async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text)
         await show_main_menu(update, context, "Main Menu:")
 
-# ------------------ Profit Summary ------------------
+# ------------------ Profit with Date Range ------------------
 async def profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
     if user_id not in (OWNER_ID, INTERMEDIARY_ID):
@@ -388,11 +423,26 @@ async def profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Unauthorized.")
         return
 
+    # Parse optional date arguments
+    start_date = None
+    end_date = None
+    if context.args:
+        try:
+            if len(context.args) >= 2:
+                start_date = context.args[0]
+                end_date = context.args[1]
+            elif len(context.args) == 1:
+                start_date = context.args[0]
+                end_date = start_date
+        except:
+            await update.message.reply_text("Usage: /profit [YYYY-MM-DD] [YYYY-MM-DD]")
+            return
+
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
 
-    # --- Owner profit in USD (existing complex query) ---
-    c.execute('''
+    # Owner profit query
+    owner_query = '''
         SELECT SUM(t.usd_received - ub.total_cost)
         FROM customer_transactions t
         JOIN (
@@ -401,22 +451,25 @@ async def profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             JOIN inventory_batches b ON u.batch_id = b.id
             GROUP BY tx_id
         ) ub ON t.id = ub.tx_id
-    ''')
+    '''
+    inter_query = 'SELECT SUM(usd_received * market_rate_at_time - actual_ghs_paid) FROM customer_transactions'
+    params = []
+    if start_date and end_date:
+        where_clause = " WHERE date BETWEEN ? AND ?"
+        owner_query += where_clause
+        inter_query += where_clause
+        params = [f"{start_date} 00:00:00", f"{end_date} 23:59:59"]
+
+    c.execute(owner_query, params)
     owner_profit_usd = c.fetchone()[0] or 0.0
-
-    # --- Intermediary profit in GHS (new calculation) ---
-    # Formula: for each transaction, (USD received × market rate) - actual GHS paid
-    c.execute('''
-        SELECT SUM(usd_received * market_rate_at_time - actual_ghs_paid)
-        FROM customer_transactions
-    ''')
-    intermediary_profit_ghs = c.fetchone()[0] or 0.0
-
+    c.execute(inter_query, params)
+    inter_profit_ghs = c.fetchone()[0] or 0.0
     conn.close()
 
+    date_str = f" from {start_date} to {end_date}" if start_date else ""
     text = (
-        f"💰 **Owner profit (USD):** ${owner_profit_usd:.2f}\n"
-        f"💸 **Intermediary profit (GHS):** {intermediary_profit_ghs:.2f} GHS"
+        f"💰 Owner profit{date_str}: ${owner_profit_usd:.2f}\n"
+        f"💸 Intermediary profit{date_str}: {inter_profit_ghs:.2f} GHS"
     )
 
     if isinstance(update, Update) and update.callback_query:
@@ -468,6 +521,154 @@ async def current_rates(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode='Markdown')
         await show_main_menu(update, context, "Main Menu:")
 
+# ------------------ Export to CSV ------------------
+async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
+    if user_id not in (OWNER_ID, INTERMEDIARY_ID):
+        if isinstance(update, Update) and update.callback_query:
+            await update.callback_query.edit_message_text("Unauthorized.")
+        else:
+            await update.message.reply_text("Unauthorized.")
+        return
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''SELECT id, usd_received, suggested_ghs, actual_ghs_paid,
+                        market_rate_at_time, owner_rate_at_time, intermediary_rate_at_time,
+                        date, recorded_by
+                 FROM customer_transactions ORDER BY date''')
+    rows = c.fetchall()
+    conn.close()
+
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['ID', 'USD Received', 'Suggested GHS', 'Actual GHS Paid',
+                     'Market Rate', 'Owner Rate', 'Intermediary Rate', 'Date', 'Recorded By'])
+    writer.writerows(rows)
+    output.seek(0)
+
+    await context.bot.send_document(
+        chat_id=update.effective_chat.id,
+        document=output.getvalue().encode('utf-8'),
+        filename='transactions.csv'
+    )
+    await show_main_menu(update, context, "Main Menu:")
+
+# ------------------ List Transactions ------------------
+async def list_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
+    if user_id not in (OWNER_ID, INTERMEDIARY_ID):
+        if isinstance(update, Update) and update.callback_query:
+            await update.callback_query.edit_message_text("Unauthorized.")
+        else:
+            await update.message.reply_text("Unauthorized.")
+        return
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''SELECT id, usd_received, actual_ghs_paid, date
+                 FROM customer_transactions ORDER BY date DESC LIMIT 10''')
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        text = "No transactions yet."
+    else:
+        text = "Recent transactions:\n"
+        for r in rows:
+            text += f"ID {r[0]}: {r[1]} USD → {r[2]} GHS on {r[3][:10]}\n"
+
+    if isinstance(update, Update) and update.callback_query:
+        await update.callback_query.edit_message_text(text)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Main Menu:",
+            reply_markup=get_main_menu_keyboard(user_id)
+        )
+    else:
+        await update.message.reply_text(text)
+        await show_main_menu(update, context, "Main Menu:")
+
+# ------------------ Delete Transaction (Owner Only) ------------------
+async def delete_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
+    if user_id != OWNER_ID:
+        if isinstance(update, Update) and update.callback_query:
+            await update.callback_query.edit_message_text("Only owner can delete transactions.")
+        else:
+            await update.message.reply_text("Only owner can delete transactions.")
+        return
+
+    try:
+        tx_id = int(context.args[0])
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        # Note: This does not adjust inventory – for a production system you'd need to restore batches.
+        # For simplicity, we just delete the transaction record.
+        c.execute("DELETE FROM customer_transactions WHERE id = ?", (tx_id,))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text(f"Transaction {tx_id} deleted. (Inventory not restored.)")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /deletetx <transaction_id>")
+    await show_main_menu(update, context, "Main Menu:")
+
+# ------------------ Audit Log ------------------
+async def audit_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
+    if user_id != OWNER_ID:
+        if isinstance(update, Update) and update.callback_query:
+            await update.callback_query.edit_message_text("Only owner can view audit log.")
+        else:
+            await update.message.reply_text("Only owner can view audit log.")
+        return
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''SELECT id, usd_received, actual_ghs_paid, recorded_by, date
+                 FROM customer_transactions ORDER BY date DESC LIMIT 20''')
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        text = "No transactions yet."
+    else:
+        text = "Audit log (last 20 transactions):\n"
+        for r in rows:
+            user = "Owner" if r[3] == OWNER_ID else "Intermediary"
+            text += f"ID {r[0]}: {r[1]} USD → {r[2]} GHS by {user} on {r[4][:19]}\n"
+
+    if isinstance(update, Update) and update.callback_query:
+        await update.callback_query.edit_message_text(text)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Main Menu:",
+            reply_markup=get_main_menu_keyboard(user_id)
+        )
+    else:
+        await update.message.reply_text(text)
+        await show_main_menu(update, context, "Main Menu:")
+
+# ------------------ Reset Database (Owner Only) ------------------
+async def reset_database(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
+    if user_id != OWNER_ID:
+        if isinstance(update, Update) and update.callback_query:
+            await update.callback_query.edit_message_text("Only owner can reset the database.")
+        else:
+            await update.message.reply_text("Only owner can reset the database.")
+        return
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    tables = ["customer_transactions", "tx_batch_usage", "inventory_batches", "bulk_transfers", "market_rates"]
+    for table in tables:
+        c.execute(f"DELETE FROM {table}")
+    conn.commit()
+    conn.close()
+    await update.message.reply_text("✅ All data cleared. Database is now empty.")
+    await show_main_menu(update, context, "Main Menu:")
+
 # ------------------ General Menu Callback Handler ------------------
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -479,12 +680,29 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Unauthorized.")
         return
 
-    # This handler only catches buttons that are NOT handled by conversation entry points
-    if data == "menu_cancel":
+    # Map menu actions to functions (non-conversation ones)
+    if data == "menu_inventory":
+        await inventory(update, context)
+    elif data == "menu_profit":
+        await profit(update, context)
+    elif data == "menu_currentrates":
+        await current_rates(update, context)
+    elif data == "menu_export":
+        await export_csv(update, context)
+    elif data == "menu_listtx":
+        await list_transactions(update, context)
+    elif data == "menu_audit":
+        await audit_log(update, context)
+    elif data == "menu_deletetx" and user_id == OWNER_ID:
+        # For simplicity, we prompt for ID via command (or start another conversation)
+        await query.edit_message_text("Use /deletetx <transaction_id> to delete.")
+    elif data == "menu_resetdb" and user_id == OWNER_ID:
+        await reset_database(update, context)
+    elif data == "menu_cancel":
         await query.edit_message_text("Cancelled. Use /start to see menu again.")
     else:
-        # Should not happen – but just in case
-        await query.edit_message_text("This feature is under construction.")
+        # Should not happen (conversation starters are handled separately)
+        pass
 
 # ------------------ Main ------------------
 def main():
@@ -493,8 +711,9 @@ def main():
 
     # Basic commands
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("fetchrate", fetch_rate_now))
 
-    # --- Conversation handlers (must come before general callback handler) ---
+    # --- Conversation handlers (must come before general callback) ---
     # Set market conversation
     setmarket_conv = ConversationHandler(
         entry_points=[
@@ -541,12 +760,27 @@ def main():
     application.add_handler(CallbackQueryHandler(inventory, pattern="^menu_inventory$"))
     application.add_handler(CallbackQueryHandler(profit, pattern="^menu_profit$"))
     application.add_handler(CallbackQueryHandler(current_rates, pattern="^menu_currentrates$"))
+    application.add_handler(CallbackQueryHandler(export_csv, pattern="^menu_export$"))
+    application.add_handler(CallbackQueryHandler(list_transactions, pattern="^menu_listtx$"))
+    application.add_handler(CallbackQueryHandler(audit_log, pattern="^menu_audit$"))
+    # Owner-only menu actions
+    application.add_handler(CallbackQueryHandler(reset_database, pattern="^menu_resetdb$"))
+    # Delete transaction uses command, not menu callback
+    application.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_deletetx$"))
     application.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_cancel$"))
 
-    # Also allow direct commands (fallback)
-    application.add_handler(CommandHandler("inventory", inventory))
+    # Additional command handlers
     application.add_handler(CommandHandler("profit", profit))
-    # /setmarket is already handled by conversation entry
+    application.add_handler(CommandHandler("inventory", inventory))
+    application.add_handler(CommandHandler("export", export_csv))
+    application.add_handler(CommandHandler("listtx", list_transactions))
+    application.add_handler(CommandHandler("deletetx", delete_transaction))
+    application.add_handler(CommandHandler("audit", audit_log))
+    application.add_handler(CommandHandler("resetdb", reset_database))
+
+    # Start the scheduler
+    scheduler.add_job(fetch_market_rate, IntervalTrigger(hours=24))
+    scheduler.start()
 
     application.run_polling()
 

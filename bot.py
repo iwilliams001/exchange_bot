@@ -676,22 +676,34 @@ async def audit_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------ Reset Database (Owner Only) ------------------
 async def reset_database(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
+    # Determine if called from callback or command
+    if update.callback_query:
+        user_id = update.callback_query.from_user.id
+        message = update.callback_query.message
+        reply_func = update.callback_query.edit_message_text
+    else:
+        user_id = update.effective_user.id
+        message = update.message
+        reply_func = update.message.reply_text
+
     if user_id != OWNER_ID:
-        if isinstance(update, Update) and update.callback_query:
-            await update.callback_query.edit_message_text("Only owner can reset the database.")
-        else:
-            await update.message.reply_text("Only owner can reset the database.")
+        await reply_func("Only owner can reset the database.")
         return
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    tables = ["customer_transactions", "tx_batch_usage", "inventory_batches", "bulk_transfers", "market_rates"]
-    for table in tables:
-        c.execute(f"DELETE FROM {table}")
-    conn.commit()
-    conn.close()
-    await update.message.reply_text("✅ All data cleared. Database is now empty.")
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        tables = ["customer_transactions", "tx_batch_usage", "inventory_batches", "bulk_transfers", "market_rates"]
+        for table in tables:
+            c.execute(f"DELETE FROM {table}")
+        conn.commit()
+        conn.close()
+        await reply_func("✅ All data cleared. Database is now empty.")
+    except Exception as e:
+        await reply_func(f"❌ Error: {e}")
+        logger.exception("Reset database failed")
+
+    # Return to main menu
     await show_main_menu(update, context, "Main Menu:")
 
 # ------------------ General Menu Callback Handler ------------------

@@ -784,5 +784,12 @@ def main():
 
     application.run_polling()
 
+async def post_init(application: Application) -> None:
+    """This function runs after the Application is initialized but before it starts polling."""
+    # Start the scheduler now that the event loop is running
+    scheduler.add_job(fetch_market_rate, IntervalTrigger(hours=24))
+    scheduler.start()
+    logger.info("Scheduler started for automatic market rate fetching.")
+
 if __name__ == '__main__':
     main()

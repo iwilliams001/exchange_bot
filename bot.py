@@ -46,26 +46,51 @@ scheduler = AsyncIOScheduler()
 
 # ------------------ Helper: Main Menu Keyboard ------------------
 def get_main_menu_keyboard(user_id):
-    """Return inline keyboard with all actions for authorized users."""
-    if user_id in (OWNER_ID, INTERMEDIARY_ID):
-        buttons = [
-            [InlineKeyboardButton("💰 Set Market Rate", callback_data="menu_setmarket")],
-            [InlineKeyboardButton("📦 Bulk Transfer", callback_data="menu_bulktransfer")],
-            [InlineKeyboardButton("📊 Inventory", callback_data="menu_inventory")],
-            [InlineKeyboardButton("📈 Profit", callback_data="menu_profit")],
-            [InlineKeyboardButton("📉 Current Rates", callback_data="menu_currentrates")],
-            [InlineKeyboardButton("💸 Pay Customer", callback_data="menu_paycustomer")],
-            [InlineKeyboardButton("📤 Export CSV", callback_data="menu_export")],
-            [InlineKeyboardButton("📋 List Transactions", callback_data="menu_listtx")],
-            [InlineKeyboardButton("🔍 Audit Log", callback_data="menu_audit")],
+    """Return inline keyboard with actions in a grid (2 columns)."""
+    if user_id not in (OWNER_ID, INTERMEDIARY_ID):
+        return None
+
+    # Define all possible buttons (label, callback_data)
+    all_buttons = [
+        ("💰 Set Market Rate", "menu_setmarket"),
+        ("📦 Bulk Transfer", "menu_bulktransfer"),
+        ("📊 Inventory", "menu_inventory"),
+        ("📈 Profit", "menu_profit"),
+        ("📉 Current Rates", "menu_currentrates"),
+        ("💸 Pay Customer", "menu_paycustomer"),
+        ("📋 List Transactions", "menu_listtx"),
+        ("📤 Export CSV", "menu_export"),
+        ("🔍 Audit Log", "menu_audit"),
+        ("🗑️ Delete Transaction", "menu_deletetx"),
+        ("🔄 Reset Database", "menu_resetdb"),
+        ("❌ Cancel", "menu_cancel"),
+    ]
+
+    # Filter buttons based on role
+    if user_id == OWNER_ID:
+        # Owner sees all buttons
+        selected = all_buttons
+    else:
+        # Intermediary sees only allowed ones
+        allowed = [
+            "menu_setmarket", "menu_bulktransfer", "menu_inventory",
+            "menu_profit", "menu_currentrates", "menu_paycustomer",
+            "menu_listtx", "menu_cancel"
         ]
-        # Owner-only sensitive actions
-        if user_id == OWNER_ID:
-            buttons.append([InlineKeyboardButton("🗑️ Delete Transaction", callback_data="menu_deletetx")])
-            buttons.append([InlineKeyboardButton("🔄 Reset Database", callback_data="menu_resetdb")])
-        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="menu_cancel")])
-        return InlineKeyboardMarkup(buttons)
-    return None
+        selected = [btn for btn in all_buttons if btn[1] in allowed]
+
+    # Arrange buttons in rows of 2 (grid)
+    keyboard = []
+    for i in range(0, len(selected), 2):
+        row = []
+        # First button
+        row.append(InlineKeyboardButton(selected[i][0], callback_data=selected[i][1]))
+        # Second button if exists
+        if i + 1 < len(selected):
+            row.append(InlineKeyboardButton(selected[i+1][0], callback_data=selected[i+1][1]))
+        keyboard.append(row)
+
+    return InlineKeyboardMarkup(keyboard)
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text="Main Menu:"):
     """Send or edit a message with the main menu."""

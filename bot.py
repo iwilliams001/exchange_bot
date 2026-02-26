@@ -705,9 +705,18 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 # ------------------ Main ------------------
+async def post_init(application: Application) -> None:
+    """This function runs after the Application is initialized but before it starts polling."""
+    # Start the scheduler now that the event loop is running
+    scheduler.add_job(fetch_market_rate, IntervalTrigger(hours=24))
+    scheduler.start()
+    logger.info("Scheduler started for automatic market rate fetching.")
+
 def main():
     init_db()
-    application = Application.builder().token(TOKEN).build()
+
+    # Create the application with the post_init hook
+    application = Application.builder().token(TOKEN).post_init(post_init).build()
 
     # Basic commands
     application.add_handler(CommandHandler("start", start))
@@ -778,18 +787,8 @@ def main():
     application.add_handler(CommandHandler("audit", audit_log))
     application.add_handler(CommandHandler("resetdb", reset_database))
 
-    # Start the scheduler
-    scheduler.add_job(fetch_market_rate, IntervalTrigger(hours=24))
-    scheduler.start()
-
+    # Start the bot (this starts the event loop)
     application.run_polling()
-
-async def post_init(application: Application) -> None:
-    """This function runs after the Application is initialized but before it starts polling."""
-    # Start the scheduler now that the event loop is running
-    scheduler.add_job(fetch_market_rate, IntervalTrigger(hours=24))
-    scheduler.start()
-    logger.info("Scheduler started for automatic market rate fetching.")
 
 if __name__ == '__main__':
     main()

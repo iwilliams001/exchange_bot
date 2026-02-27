@@ -466,6 +466,16 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
 
     owner_share = usd * owner  # GHS to be deducted from inventory (owner's cost)
 
+    # Prevent intermediary from overpaying beyond owner's share
+    if actual > owner_share:
+        await message.reply_text(
+            f"❌ Amount exceeds owner's share ({owner_share:.2f} GHS).\n"
+            "To avoid a loss, you cannot pay more than the owner's share.\n"
+            "Please enter a lower amount or negotiate with the customer."
+        )
+        await show_main_menu(update_or_query, context, user_id, "Main Menu:")
+        return ConversationHandler.END
+
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("SELECT SUM(remaining_ghs) FROM inventory_batches")
@@ -527,7 +537,7 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
         f"USD: {usd}\n"
         f"GHS paid: {actual:.2f}\n"
         f"Suggested: {suggested:.2f}\n"
-        f"Remaining GHS (owner's inventory): {remaining:.2f}"
+        f"Remaining GHS: {remaining:.2f}"
     )
     await message.reply_text(user_message)
 
@@ -623,7 +633,7 @@ async def profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_func("Unauthorized.")
         return
 
-    # Parse optional date arguments
+    # Parse optional date arguments (same as before)
     start_date = None
     end_date = None
     if context.args:
@@ -638,51 +648,51 @@ async def profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_func("Usage: /profit [YYYY-MM-DD] [YYYY-MM-DD]")
             return
 
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
 
-        owner_query = '''
-            SELECT SUM(t.usd_received - ub.total_cost)
-            FROM customer_transactions t
-            JOIN (
-                SELECT tx_id, SUM(ghs_used * b.usd_cost_per_ghs) as total_cost
-                FROM tx_batch_usage u
-                JOIN inventory_batches b ON u.batch_id = b.id
-                GROUP BY tx_id
-            ) ub ON t.id = ub.tx_id
-        '''
-        inter_query = 'SELECT SUM(usd_received * market_rate_at_time - actual_ghs_paid) FROM customer_transactions'
-        params = []
-        if start_date and end_date:
-            where = " WHERE date BETWEEN ? AND ?"
-            owner_query += where
-            inter_query += where
-            params = [f"{start_date} 00:00:00", f"{end_date} 23:59:59"]
+    # Owner profit: sum of (usd_received - cost_of_owner_share)
+    owner_query = '''
+        SELECT SUM(t.usd_received - ub.total_cost)
+        FROM customer_transactions t
+        JOIN (
+            SELECT tx_id, SUM(ghs_used * b.usd_cost_per_ghs) as total_cost
+            FROM tx_batch_usage u
+            JOIN inventory_batches b ON u.batch_id = b.id
+            GROUP BY tx_id
+        ) ub ON t.id = ub.tx_id
+    '''
+    # Intermediary profit: sum of (usd_received * market_rate - actual_ghs_paid)
+    inter_query = 'SELECT SUM(usd_received * market_rate_at_time - actual_ghs_paid) FROM customer_transactions'
 
-        c.execute(owner_query, params)
-        owner_profit_usd = c.fetchone()[0] or 0.0
-        c.execute(inter_query, params)
-        inter_profit_ghs = c.fetchone()[0] or 0.0
-        conn.close()
+    params = []
+    if start_date and end_date:
+        where = " WHERE date BETWEEN ? AND ?"
+        owner_query += where
+        inter_query += where
+        params = [f"{start_date} 00:00:00", f"{end_date} 23:59:59"]
 
-        date_str = f" from {start_date} to {end_date}" if start_date else ""
-        text = (
-            f"💰 Owner profit{date_str}: ${owner_profit_usd:.2f}\n"
-            f"💸 Intermediary profit{date_str}: {inter_profit_ghs:.2f} GHS"
-        )
-        await reply_func(text, parse_mode='Markdown')
-    except Exception as e:
-        await reply_func(f"Error: {e}")
-        logger.exception("Profit failed")
+    c.execute(owner_query, params)
+    owner_profit_usd = c.fetchone()[0] or 0.0
+    c.execute(inter_query, params)
+    inter_profit_ghs = c.fetchone()[0] or 0.0
+    conn.close()
+
+    date_str = f" from {start_date} to {end_date}" if start_date else ""
+    text = (
+        f"💰 Owner profit{date_str}: ${owner_profit_usd:.2f}\n"
+        f"💸 Intermediary profit{date_str}: {inter_profit_ghs:.2f} GHS"
+    )
 
     if is_callback:
+        await reply_func(text, parse_mode='Markdown')
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="Main Menu:",
             reply_markup=get_main_menu_keyboard(role)
         )
     else:
+        await update.message.reply_text(text, parse_mode='Markdown')
         await show_main_menu(update, context, user_id, "Main Menu:")
 
 # ------------------ Current Rates ------------------
@@ -715,9 +725,9 @@ async def current_rates(update: Update, context: ContextTypes.DEFAULT_TYPE):
             owner = owner_rate(market)
             inter = intermediary_rate(market)
             text = (f"📊 **Current Rates**\n"
-                    f"Market: {market:.4f} GHS/USD (as of {ts[:10]})\n"
-                    f"Owner rate: {owner:.4f} GHS/USD\n"
-                    f"Intermediary rate: {inter:.4f} GHS/USD")
+                    f"Market: {market:.2f} GHS/USD (as of {ts[:10]})\n"
+                    f"Owner rate: {owner:.1f} GHS/USD\n"
+                    f"Intermediary rate: {inter:.1f} GHS/USD")
         await reply_func(text, parse_mode='Markdown')
     except Exception as e:
         await reply_func(f"Error: {e}")

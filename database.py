@@ -54,6 +54,12 @@ def init_db():
                   notes TEXT,
                   status TEXT DEFAULT 'completed')''')
 
+    # Add owner_profit_usd column to existing customer_transactions table (if not exists)
+    try:
+        c.execute("ALTER TABLE customer_transactions ADD COLUMN owner_profit_usd REAL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
     # Users table (approved users)
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (telegram_id INTEGER PRIMARY KEY,

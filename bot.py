@@ -514,10 +514,11 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
     c = conn.cursor()
     c.execute('''INSERT INTO customer_transactions
                  (usd_received, suggested_ghs, actual_ghs_paid, market_rate_at_time,
-                  owner_rate_at_time, intermediary_rate_at_time, date, recorded_by)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                  owner_rate_at_time, intermediary_rate_at_time, date, recorded_by,
+                  owner_profit_usd)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
               (usd, suggested, actual, market, owner, inter,
-               datetime.now().isoformat(), user_id))
+               datetime.now().isoformat(), user_id, owner_profit_usd))
     tx_id = c.lastrowid
 
     # Record batch usage (for owner_share deduction)
@@ -651,18 +652,9 @@ async def profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
 
-    # Owner profit: sum of (usd_received - cost_of_owner_share)
-    owner_query = '''
-        SELECT SUM(t.usd_received - ub.total_cost)
-        FROM customer_transactions t
-        JOIN (
-            SELECT tx_id, SUM(ghs_used * b.usd_cost_per_ghs) as total_cost
-            FROM tx_batch_usage u
-            JOIN inventory_batches b ON u.batch_id = b.id
-            GROUP BY tx_id
-        ) ub ON t.id = ub.tx_id
-    '''
-    # Intermediary profit: sum of (usd_received * market_rate - actual_ghs_paid)
+    # Owner profit: sum of stored owner_profit_usd
+    owner_query = 'SELECT SUM(owner_profit_usd) FROM customer_transactions'
+    # Intermediary profit: unchanged
     inter_query = 'SELECT SUM(usd_received * market_rate_at_time - actual_ghs_paid) FROM customer_transactions'
 
     params = []

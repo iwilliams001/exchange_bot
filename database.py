@@ -54,6 +54,19 @@ def init_db():
                   notes TEXT,
                   status TEXT DEFAULT 'completed')''')
 
+    # Users table (approved users)
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (telegram_id INTEGER PRIMARY KEY,
+                  role TEXT NOT NULL CHECK(role IN ('owner', 'intermediary')))''')
+
+    # Pending users table (requests awaiting approval)
+    c.execute('''CREATE TABLE IF NOT EXISTS pending_users
+                 (telegram_id INTEGER PRIMARY KEY,
+                  username TEXT,
+                  first_name TEXT,
+                  last_name TEXT,
+                  requested_at TEXT NOT NULL)''')
+
     c.execute('''CREATE TABLE IF NOT EXISTS tx_batch_usage
                  (tx_id INTEGER NOT NULL,
                   batch_id INTEGER NOT NULL,

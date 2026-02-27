@@ -314,25 +314,51 @@ async def bulk_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if role is None:
             await update.callback_query.edit_message_text("Unauthorized.")
             return ConversationHandler.END
-        await update.callback_query.edit_message_text("Enter USD amount sent:")
+        await update.callback_query.edit_message_text("Enter GHS amount received:")
     else:
         user_id = update.effective_user.id
         role = await get_user_role(user_id)
         if role is None:
             await update.message.reply_text("Unauthorized.")
             return ConversationHandler.END
-        await update.message.reply_text("Enter USD amount sent:")
-    return "BULK_USD"
+        await update.message.reply_text("Enter GHS amount received:")
+    return "BULK_GHS"
 
-async def bulk_usd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def bulk_ghs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        usd = float(update.message.text)
-        context.user_data['bulk_usd'] = usd
-        await update.message.reply_text("Enter market rate at time of transfer (or type 'current' to use latest):")
-        return "BULK_RATE"
+        ghs = float(update.message.text)
     except ValueError:
         await update.message.reply_text("Please enter a valid number.")
-        return "BULK_USD"
+        return "BULK_GHS"
+
+    # Fetch the latest market rate
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT rate FROM market_rates ORDER BY timestamp DESC LIMIT 1")
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        await update.message.reply_text("No market rate set. Please set a rate first using /setmarket.")
+        return ConversationHandler.END
+
+    rate = row[0]
+    usd = ghs / rate  # back‑calculate the USD amount that would yield this GHS at the current rate
+
+    # Record the bulk transfer
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT INTO bulk_transfers (usd_amount, market_rate, ghs_received, date) VALUES (?, ?, ?, ?)",
+              (usd, rate, ghs, datetime.now().isoformat()))
+    bulk_id = c.lastrowid
+    c.execute("INSERT INTO inventory_batches (bulk_id, remaining_ghs, usd_cost_per_ghs) VALUES (?, ?, ?)",
+              (bulk_id, ghs, 1/rate))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(f"Bulk transfer recorded: {ghs:.2f} GHS @ market rate {rate:.4f} = ${usd:.2f} USD")
+    await show_main_menu(update, context, update.effective_user.id, "Main Menu:")
+    return ConversationHandler.END
 
 async def bulk_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -1014,8 +1040,7 @@ def main():
             CallbackQueryHandler(bulk_start, pattern="^menu_bulktransfer$")
         ],
         states={
-            "BULK_USD": [MessageHandler(filters.TEXT & ~filters.COMMAND, bulk_usd)],
-            "BULK_RATE": [MessageHandler(filters.TEXT & ~filters.COMMAND, bulk_rate)],
+            "BULK_GHS": [MessageHandler(filters.TEXT & ~filters.COMMAND, bulk_ghs)]
         },
         fallbacks=[CallbackQueryHandler(menu_callback, pattern="^menu_cancel$")],
         per_message=False

@@ -409,13 +409,13 @@ async def pay_usd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['suggested'] = suggested
         keyboard = [
             [InlineKeyboardButton(f"✅ Pay {suggested:.2f}", callback_data='use_suggested'),
-             InlineKeyboardButton("✏️ Enter different amount", callback_data='enter_different')],
+             InlineKeyboardButton("✏️ Enter diff amount", callback_data='enter_different')],
             [InlineKeyboardButton("❌ Cancel", callback_data='cancel_transaction')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
             f"Suggested GHS amount: {suggested:.2f}\n"
-            f"Owner rate: {owner:.1f} | Intermediary rate: {inter:.1f}\n"
+            f"Owner rate: {owner:.1f} | Prince rate: {inter:.1f}\n"
             "What do you want to do?",
             reply_markup=reply_markup
         )
@@ -673,7 +673,7 @@ async def profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     date_str = f" from {start_date} to {end_date}" if start_date else ""
     text = (
         f"💰 Owner profit{date_str}: ${owner_profit_usd:.2f}\n"
-        f"💸 Intermediary profit{date_str}: {inter_profit_ghs:.2f} GHS"
+        f"💸 Prince profit{date_str}: {inter_profit_ghs:.2f} GHS"
     )
 
     if is_callback:
@@ -719,7 +719,7 @@ async def current_rates(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = (f"📊 **Current Rates**\n"
                     f"Market: {market:.2f} GHS/USD (as of {ts[:10]})\n"
                     f"Owner rate: {owner:.1f} GHS/USD\n"
-                    f"Intermediary rate: {inter:.1f} GHS/USD")
+                    f"Prince rate: {inter:.1f} GHS/USD")
         await reply_func(text, parse_mode='Markdown')
     except Exception as e:
         await reply_func(f"Error: {e}")

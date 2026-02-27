@@ -8,7 +8,7 @@ def floor_step(value, step=0.5):
     return math.floor(value / step) * step
 
 def owner_rate(market):
-    base = market * 0.85
+    base = market * 0.8
     floored = floor_step(base)
     if (base - floored) > 0.5:
         return floored - 0.5

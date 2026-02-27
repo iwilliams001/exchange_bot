@@ -300,6 +300,20 @@ async def setmarket_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
         await update.message.reply_text(f"Market rate set to {rate}")
+
+        # 🔔 Notify owner if performed by intermediary
+        if user_id != OWNER_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=OWNER_ID,
+                    text=(
+                        f"🔔 Intermediary set market rate:\n"
+                        f"New rate: {rate} GHS/USD"
+                    )
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify owner: {e}")
+
         await show_main_menu(update, context, user_id, "Main Menu:")
     except ValueError:
         await update.message.reply_text("Invalid number. Please enter a valid rate.")
@@ -361,26 +375,34 @@ async def bulk_ghs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def bulk_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text.lower() == 'current':
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute("SELECT rate FROM market_rates ORDER BY timestamp DESC LIMIT 1")
-        row = c.fetchone()
-        conn.close()
-        if row:
-            rate = row[0]
-        else:
-            await update.message.reply_text("No market rate set. Please enter manually.")
-            return "BULK_RATE"
-    else:
-        try:
-            rate = float(text)
-        except ValueError:
-            await update.message.reply_text("Invalid number. Try again:")
-            return "BULK_RATE"
-    usd = context.user_data['bulk_usd']
-    ghs = usd * rate
+    # This function now expects GHS amount (the flow changed)
+    try:
+        ghs = float(update.message.text)
+    except ValueError:
+        await update.message.reply_text("Please enter a valid number.")
+        return "BULK_GHS"
+
+    user_id = update.effective_user.id
+    role = await get_user_role(user_id)
+    if role is None:
+        await update.message.reply_text("Unauthorized.")
+        return ConversationHandler.END
+
+    # Fetch the latest market rate
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT rate FROM market_rates ORDER BY timestamp DESC LIMIT 1")
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        await update.message.reply_text("No market rate set. Please set a rate first using /setmarket.")
+        return ConversationHandler.END
+
+    rate = row[0]
+    usd = ghs / rate  # back‑calculate USD
+
+    # Record the bulk transfer
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("INSERT INTO bulk_transfers (usd_amount, market_rate, ghs_received, date) VALUES (?, ?, ?, ?)",
@@ -390,8 +412,25 @@ async def bulk_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
               (bulk_id, ghs, 1/rate))
     conn.commit()
     conn.close()
-    await update.message.reply_text(f"Bulk transfer recorded: {usd} USD @ {rate} = {ghs:.2f} GHS")
-    await show_main_menu(update, context, update.effective_user.id, "Main Menu:")
+
+    await update.message.reply_text(f"Bulk transfer recorded: {ghs:.2f} GHS @ market rate {rate:.4f} = ${usd:.2f} USD")
+
+    # 🔔 Notify owner if performed by intermediary
+    if user_id != OWNER_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text=(
+                    f"🔔 Intermediary recorded a bulk transfer:\n"
+                    f"GHS: {ghs:.2f}\n"
+                    f"Market rate: {rate}\n"
+                    f"USD equivalent: ${usd:.2f}"
+                )
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify owner: {e}")
+
+    await show_main_menu(update, context, user_id, "Main Menu:")
     return ConversationHandler.END
 
 # ------------------ Pay Customer Conversation ------------------
@@ -871,14 +910,42 @@ async def delete_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE)
         tx_id = int(context.args[0])
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        # Note: This does not adjust inventory – for a production system you'd need to restore batches.
-        # For simplicity, we just delete the transaction record.
+
+        # First, retrieve all batch usage records for this transaction
+        c.execute("SELECT batch_id, ghs_used FROM tx_batch_usage WHERE tx_id = ?", (tx_id,))
+        usage_records = c.fetchall()
+
+        if not usage_records:
+            # No linked batches – maybe transaction doesn't exist or is orphaned
+            c.execute("DELETE FROM customer_transactions WHERE id = ?", (tx_id,))
+            conn.commit()
+            conn.close()
+            await update.message.reply_text(f"Transaction {tx_id} deleted (no inventory impact).")
+            await show_main_menu(update, context, user_id, "Main Menu:")
+            return
+
+        # Restore each batch's remaining GHS
+        for batch_id, ghs_used in usage_records:
+            c.execute("UPDATE inventory_batches SET remaining_ghs = remaining_ghs + ? WHERE id = ?",
+                      (ghs_used, batch_id))
+
+        # Delete the usage records
+        c.execute("DELETE FROM tx_batch_usage WHERE tx_id = ?", (tx_id,))
+
+        # Finally, delete the transaction itself
         c.execute("DELETE FROM customer_transactions WHERE id = ?", (tx_id,))
+
         conn.commit()
         conn.close()
-        await update.message.reply_text(f"Transaction {tx_id} deleted. (Inventory not restored.)")
+
+        await update.message.reply_text(f"Transaction {tx_id} deleted and inventory restored.")
+
     except (IndexError, ValueError):
         await update.message.reply_text("Usage: /deletetx <transaction_id>")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+        logger.exception("Delete transaction failed")
+
     await show_main_menu(update, context, user_id, "Main Menu:")
 
 # ------------------ Audit Log (Owner Only) ------------------

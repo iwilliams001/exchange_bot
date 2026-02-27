@@ -456,28 +456,43 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
     owner = context.user_data['owner_rate']
     inter = context.user_data['intermediary_rate']
 
+    owner_share = usd * owner  # GHS to be deducted from inventory (owner's cost)
+
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("SELECT SUM(remaining_ghs) FROM inventory_batches")
     total_ghs = c.fetchone()[0] or 0.0
-    if total_ghs < actual:
-        await message.reply_text(f"Insufficient GHS! Available: {total_ghs:.2f}. Transaction cancelled.")
+
+    # Check inventory against owner_share (not actual)
+    if total_ghs < owner_share:
+        await message.reply_text(
+            f"Insufficient GHS to cover owner's share!\n"
+            f"Available: {total_ghs:.2f} GHS, needed: {owner_share:.2f} GHS.\n"
+            f"Please top up inventory and try again."
+        )
         await show_main_menu(update_or_query, context, user_id, "Main Menu:")
         return ConversationHandler.END
 
+    # Deduct owner_share from inventory (FIFO)
     try:
-        usage, total_cost_usd = deduct_from_inventory(actual)
+        usage, total_cost_usd = deduct_from_inventory(owner_share)  # now deducts owner_share
     except Exception as e:
         await message.reply_text(str(e))
         await show_main_menu(update_or_query, context, user_id, "Main Menu:")
         return ConversationHandler.END
 
-    owner_profit = usd - total_cost_usd
-    if owner_profit < 0:
-        await message.reply_text(f"This transaction would result in negative owner profit (${owner_profit:.2f}). Not allowed. Transaction cancelled.")
+    # Owner profit based on cost of owner_share
+    owner_profit_usd = usd - total_cost_usd
+    if owner_profit_usd < 0:
+        await message.reply_text(
+            f"Critical error: owner profit negative (${owner_profit_usd:.2f}). "
+            "Transaction cancelled. Contact support."
+        )
+        # In production, you might want to rollback the inventory deduction here.
         await show_main_menu(update_or_query, context, user_id, "Main Menu:")
         return ConversationHandler.END
 
+    # Record transaction (store owner_share as well? Not necessary, but we have owner_rate)
     c = conn.cursor()
     c.execute('''INSERT INTO customer_transactions
                  (usd_received, suggested_ghs, actual_ghs_paid, market_rate_at_time,
@@ -487,6 +502,7 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
                datetime.now().isoformat(), user_id))
     tx_id = c.lastrowid
 
+    # Record batch usage (for owner_share deduction)
     for batch_id, ghs_used, cost in usage:
         c.execute("INSERT INTO tx_batch_usage (tx_id, batch_id, ghs_used) VALUES (?, ?, ?)",
                   (tx_id, batch_id, ghs_used))
@@ -494,35 +510,38 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
     conn.commit()
     conn.close()
 
-    remaining = total_ghs - actual
-    await message.reply_text(
+    remaining = total_ghs - owner_share  # remaining after deducting owner's share
+
+    # Message for the user who performed the transaction (intermediary or owner)
+    # Do NOT include owner profit
+    user_message = (
         f"✅ Transaction recorded!\n"
         f"USD: {usd}\n"
         f"GHS paid: {actual:.2f}\n"
         f"Suggested: {suggested:.2f}\n"
-        f"Owner profit: ${owner_profit:.2f}\n"
-        f"Remaining GHS: {remaining:.2f}"
+        f"Remaining GHS (owner's inventory): {remaining:.2f}"
     )
+    await message.reply_text(user_message)
 
-    # Notify owner if intermediary performed transaction
-    owner_role = await get_user_role(user_id)
-    if owner_role == 'intermediary':
+    # Notify owner separately with profit details, unless the user is the owner
+    if user_id != OWNER_ID:
         try:
             await context.bot.send_message(
                 chat_id=OWNER_ID,
                 text=(
-                    f"🔔 Intermediary recorded a transaction:\n"
+                    f"🔔 Transaction by intermediary:\n"
                     f"USD: {usd}\n"
                     f"GHS paid: {actual:.2f}\n"
-                    f"Owner profit: ${owner_profit:.2f}"
+                    f"Owner's share deducted: {owner_share:.2f} GHS\n"
+                    f"Owner profit: ${owner_profit_usd:.2f}\n"
+                    f"Remaining GHS: {remaining:.2f}"
                 )
             )
         except Exception as e:
             logger.error(f"Failed to notify owner: {e}")
 
-    # Low inventory alert
+    # Low inventory alert (using remaining after owner_share deduction)
     if remaining < 1000:  # threshold
-        # Notify all owners (in future could notify all owners in DB)
         for uid in (OWNER_ID,):
             try:
                 await context.bot.send_message(

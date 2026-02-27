@@ -24,8 +24,7 @@ from utils import owner_rate, intermediary_rate, deduct_from_inventory
 
 # ------------------ CONFIGURATION ------------------
 TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-INTERMEDIARY_ID = int(os.getenv("INTERMEDIARY_ID", "0"))
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))          # The initial owner (from env)
 
 if not TOKEN or OWNER_ID == 0:
     raise ValueError("Missing required environment variables!")
@@ -44,12 +43,55 @@ SET_MARKET_RATE = 3
 # Scheduler for auto‑fetching market rate
 scheduler = AsyncIOScheduler()
 
-# ------------------ Helper: Main Menu Keyboard ------------------
-def get_main_menu_keyboard(user_id):
-    """Return inline keyboard with actions in a grid (2 columns)."""
-    if user_id not in (OWNER_ID, INTERMEDIARY_ID):
-        return None
+# ------------------ Database Helpers for User Management ------------------
+async def get_user_role(user_id: int) -> str | None:
+    """Return role of user if approved, else None."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT role FROM users WHERE telegram_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
 
+async def add_user(user_id: int, role: str):
+    """Add or update a user in the users table."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO users (telegram_id, role) VALUES (?, ?)", (user_id, role))
+    conn.commit()
+    conn.close()
+
+async def remove_pending(user_id: int):
+    """Remove a user from pending requests after processing."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("DELETE FROM pending_users WHERE telegram_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+async def add_pending(user_id: int, username: str = "", first_name: str = "", last_name: str = ""):
+    """Add a user to pending requests."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''INSERT OR IGNORE INTO pending_users
+                 (telegram_id, username, first_name, last_name, requested_at)
+                 VALUES (?, ?, ?, ?, ?)''',
+              (user_id, username, first_name, last_name, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+async def is_pending(user_id: int) -> bool:
+    """Check if user is already pending."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM pending_users WHERE telegram_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row is not None
+
+# ------------------ Helper: Main Menu Keyboard ------------------
+def get_main_menu_keyboard(role: str):
+    """Return inline keyboard with actions based on user role."""
     # Define all possible buttons (label, callback_data)
     all_buttons = [
         ("💰 Set Market Rate", "menu_setmarket"),
@@ -66,12 +108,10 @@ def get_main_menu_keyboard(user_id):
         ("❌ Cancel", "menu_cancel"),
     ]
 
-    # Filter buttons based on role
-    if user_id == OWNER_ID:
-        # Owner sees all buttons
-        selected = all_buttons
-    else:
-        # Intermediary sees only allowed ones
+    # Determine allowed actions based on role
+    if role == 'owner':
+        selected = all_buttons  # owners see everything
+    else:  # intermediary
         allowed = [
             "menu_setmarket", "menu_bulktransfer", "menu_inventory",
             "menu_profit", "menu_currentrates", "menu_paycustomer",
@@ -79,44 +119,126 @@ def get_main_menu_keyboard(user_id):
         ]
         selected = [btn for btn in all_buttons if btn[1] in allowed]
 
-    # Arrange buttons in rows of 2 (grid)
+    # Arrange in rows of 2 (grid)
     keyboard = []
     for i in range(0, len(selected), 2):
         row = []
-        # First button
         row.append(InlineKeyboardButton(selected[i][0], callback_data=selected[i][1]))
-        # Second button if exists
         if i + 1 < len(selected):
             row.append(InlineKeyboardButton(selected[i+1][0], callback_data=selected[i+1][1]))
         keyboard.append(row)
 
     return InlineKeyboardMarkup(keyboard)
 
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text="Main Menu:"):
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, text="Main Menu:"):
     """Send or edit a message with the main menu."""
-    user_id = update.effective_user.id
-    keyboard = get_main_menu_keyboard(user_id)
-    if keyboard is None:
-        await (update.callback_query.edit_message_text("Unauthorized.") if update.callback_query else update.message.reply_text("Unauthorized."))
+    role = await get_user_role(user_id)
+    if role is None:
+        # This should not happen if called for approved users
         return
+    keyboard = get_main_menu_keyboard(role)
     if update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=keyboard)
     else:
         await update.message.reply_text(text, reply_markup=keyboard)
 
-# ------------------ Start Command ------------------
+# ------------------ Start Command & Approval Flow ------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in (OWNER_ID, INTERMEDIARY_ID):
-        await update.message.reply_text("Unauthorized.")
+    user = update.effective_user
+    user_id = user.id
+
+    # Check if already approved
+    role = await get_user_role(user_id)
+    if role:
+        await show_main_menu(update, context, user_id, f"Welcome back! Choose an action:")
         return
-    await show_main_menu(update, context, "Welcome! Choose an action:")
+
+    # Check if already pending
+    if await is_pending(user_id):
+        await update.message.reply_text("Your request is already pending. Please wait for owner approval.")
+        return
+
+    # New user – add to pending and notify owner
+    await add_pending(user_id, user.username or "", user.first_name or "", user.last_name or "")
+
+    # Notify owner
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve as Owner", callback_data=f"approve_owner_{user_id}"),
+            InlineKeyboardButton("✅ Approve as Intermediary", callback_data=f"approve_inter_{user_id}")
+        ],
+        [InlineKeyboardButton("❌ Reject", callback_data=f"reject_{user_id}")]
+    ])
+    name_parts = []
+    if user.first_name:
+        name_parts.append(user.first_name)
+    if user.last_name:
+        name_parts.append(user.last_name)
+    full_name = " ".join(name_parts) or "Unknown"
+    username_disp = f" (@{user.username})" if user.username else ""
+    await context.bot.send_message(
+        chat_id=OWNER_ID,
+        text=(
+            f"🆕 New user request:\n"
+            f"ID: `{user_id}`\n"
+            f"Name: {full_name}{username_disp}\n"
+            f"Choose action:"
+        ),
+        reply_markup=keyboard,
+        parse_mode='Markdown'
+    )
+
+    await update.message.reply_text("Your request has been sent to the owner. You will be notified once approved.")
+
+# ------------------ Approval Callback Handler ------------------
+async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    owner_id = query.from_user.id
+
+    if owner_id != OWNER_ID:
+        await query.edit_message_text("Only the owner can approve users.")
+        return
+
+    # Parse callback data
+    parts = data.split('_')
+    action = parts[0]        # approve or reject
+    role = parts[1] if action == 'approve' else None  # owner or inter
+    user_id = int(parts[-1])
+
+    if action == 'reject':
+        await remove_pending(user_id)
+        await query.edit_message_text(f"User {user_id} rejected.")
+        # Optionally notify the rejected user
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="Your request to use the bot was rejected by the owner."
+            )
+        except Exception as e:
+            logger.error(f"Could not notify rejected user {user_id}: {e}")
+        return
+
+    # Approve
+    full_role = 'owner' if role == 'owner' else 'intermediary'
+    await add_user(user_id, full_role)
+    await remove_pending(user_id)
+    await query.edit_message_text(f"User {user_id} approved as {full_role}.")
+
+    # Notify the user
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"✅ Your request has been approved! You now have {full_role} access. Send /start to begin."
+        )
+    except Exception as e:
+        logger.error(f"Could not notify approved user {user_id}: {e}")
 
 # ------------------ Automatic Market Rate Fetching ------------------
 async def fetch_market_rate():
     """Fetch USD/GHS rate from a free API and store it."""
     try:
-        # Using exchangerate-api.com (free, no key)
         async with httpx.AsyncClient() as client:
             response = await client.get("https://api.exchangerate-api.com/v4/latest/USD")
             data = response.json()
@@ -134,16 +256,19 @@ async def fetch_market_rate():
 async def fetch_rate_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manual command to trigger rate fetch."""
     user_id = update.effective_user.id
-    if user_id not in (OWNER_ID, INTERMEDIARY_ID):
+    role = await get_user_role(user_id)
+    if role is None:
+        await update.message.reply_text("Unauthorized.")
         return
     await fetch_market_rate()
     await update.message.reply_text("Market rate fetched and stored.")
-    await show_main_menu(update, context, "Main Menu:")
+    await show_main_menu(update, context, user_id, "Main Menu:")
 
 # ------------------ Set Market Rate Conversation ------------------
 async def setmarket_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
-    if user_id not in (OWNER_ID, INTERMEDIARY_ID):
+    role = await get_user_role(user_id)
+    if role is None:
         if isinstance(update, Update) and update.callback_query:
             await update.callback_query.edit_message_text("Unauthorized.")
         else:
@@ -167,7 +292,7 @@ async def setmarket_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
         await update.message.reply_text(f"Market rate set to {rate}")
-        await show_main_menu(update, context, "Main Menu:")
+        await show_main_menu(update, context, user_id, "Main Menu:")
     except ValueError:
         await update.message.reply_text("Invalid number. Please enter a valid rate.")
         return SET_MARKET_RATE
@@ -177,13 +302,15 @@ async def setmarket_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bulk_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(update, Update) and update.callback_query:
         user_id = update.callback_query.from_user.id
-        if user_id not in (OWNER_ID, INTERMEDIARY_ID):
+        role = await get_user_role(user_id)
+        if role is None:
             await update.callback_query.edit_message_text("Unauthorized.")
             return ConversationHandler.END
         await update.callback_query.edit_message_text("Enter USD amount sent:")
     else:
         user_id = update.effective_user.id
-        if user_id not in (OWNER_ID, INTERMEDIARY_ID):
+        role = await get_user_role(user_id)
+        if role is None:
             await update.message.reply_text("Unauthorized.")
             return ConversationHandler.END
         await update.message.reply_text("Enter USD amount sent:")
@@ -230,20 +357,22 @@ async def bulk_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     await update.message.reply_text(f"Bulk transfer recorded: {usd} USD @ {rate} = {ghs:.2f} GHS")
-    await show_main_menu(update, context, "Main Menu:")
+    await show_main_menu(update, context, update.effective_user.id, "Main Menu:")
     return ConversationHandler.END
 
 # ------------------ Pay Customer Conversation ------------------
 async def pay_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(update, Update) and update.callback_query:
         user_id = update.callback_query.from_user.id
-        if user_id not in (OWNER_ID, INTERMEDIARY_ID):
+        role = await get_user_role(user_id)
+        if role is None:
             await update.callback_query.edit_message_text("Unauthorized.")
             return ConversationHandler.END
         await update.callback_query.edit_message_text("Enter USD amount received from customer:")
     else:
         user_id = update.effective_user.id
-        if user_id not in (OWNER_ID, INTERMEDIARY_ID):
+        role = await get_user_role(user_id)
+        if role is None:
             await update.message.reply_text("Unauthorized.")
             return ConversationHandler.END
         await update.message.reply_text("Enter USD amount received from customer:")
@@ -298,7 +427,7 @@ async def pay_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ACTUAL_AMOUNT
     elif query.data == 'cancel_transaction':
         await query.edit_message_text("Transaction cancelled.")
-        await show_main_menu(update, context, "Main Menu:")
+        await show_main_menu(update, context, query.from_user.id, "Main Menu:")
         return ConversationHandler.END
 
 async def pay_actual(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -314,9 +443,11 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
     if isinstance(update_or_query, Update):
         user_id = update_or_query.effective_user.id
         message = update_or_query.message
+        is_callback = False
     else:
         user_id = update_or_query.from_user.id
         message = update_or_query.message
+        is_callback = True
 
     usd = context.user_data['usd_received']
     actual = context.user_data['actual_ghs']
@@ -331,22 +462,23 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
     total_ghs = c.fetchone()[0] or 0.0
     if total_ghs < actual:
         await message.reply_text(f"Insufficient GHS! Available: {total_ghs:.2f}. Transaction cancelled.")
-        await show_main_menu(update_or_query, context, "Main Menu:")
+        await show_main_menu(update_or_query, context, user_id, "Main Menu:")
         return ConversationHandler.END
 
     try:
         usage, total_cost_usd = deduct_from_inventory(actual)
     except Exception as e:
         await message.reply_text(str(e))
-        await show_main_menu(update_or_query, context, "Main Menu:")
+        await show_main_menu(update_or_query, context, user_id, "Main Menu:")
         return ConversationHandler.END
 
     owner_profit = usd - total_cost_usd
     if owner_profit < 0:
         await message.reply_text(f"This transaction would result in negative owner profit (${owner_profit:.2f}). Not allowed. Transaction cancelled.")
-        await show_main_menu(update_or_query, context, "Main Menu:")
+        await show_main_menu(update_or_query, context, user_id, "Main Menu:")
         return ConversationHandler.END
 
+    c = conn.cursor()
     c.execute('''INSERT INTO customer_transactions
                  (usd_received, suggested_ghs, actual_ghs_paid, market_rate_at_time,
                   owner_rate_at_time, intermediary_rate_at_time, date, recorded_by)
@@ -373,7 +505,8 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
     )
 
     # Notify owner if intermediary performed transaction
-    if user_id != OWNER_ID:
+    owner_role = await get_user_role(user_id)
+    if owner_role == 'intermediary':
         try:
             await context.bot.send_message(
                 chat_id=OWNER_ID,
@@ -389,7 +522,8 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
 
     # Low inventory alert
     if remaining < 1000:  # threshold
-        for uid in (OWNER_ID, INTERMEDIARY_ID):
+        # Notify all owners (in future could notify all owners in DB)
+        for uid in (OWNER_ID,):
             try:
                 await context.bot.send_message(
                     chat_id=uid,
@@ -398,24 +532,22 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
             except Exception as e:
                 logger.error(f"Failed to alert user {uid}: {e}")
 
-    await show_main_menu(update_or_query, context, "Main Menu:")
+    await show_main_menu(update_or_query, context, user_id, "Main Menu:")
     return ConversationHandler.END
 
 # ------------------ Inventory Check ------------------
 async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Determine caller type
     if update.callback_query:
         user_id = update.callback_query.from_user.id
-        message = update.callback_query.message
         reply_func = update.callback_query.edit_message_text
         is_callback = True
     else:
         user_id = update.effective_user.id
-        message = update.message
         reply_func = update.message.reply_text
         is_callback = False
 
-    if user_id not in (OWNER_ID, INTERMEDIARY_ID):
+    role = await get_user_role(user_id)
+    if role is None:
         await reply_func("Unauthorized.")
         return
 
@@ -439,15 +571,14 @@ async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_func(f"Error: {e}")
         logger.exception("Inventory failed")
 
-    # Return to main menu
     if is_callback:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="Main Menu:",
-            reply_markup=get_main_menu_keyboard(user_id)
+            reply_markup=get_main_menu_keyboard(role)
         )
     else:
-        await show_main_menu(update, context, "Main Menu:")
+        await show_main_menu(update, context, user_id, "Main Menu:")
 
 # ------------------ Profit with Date Range ------------------
 async def profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -460,7 +591,8 @@ async def profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_func = update.message.reply_text
         is_callback = False
 
-    if user_id not in (OWNER_ID, INTERMEDIARY_ID):
+    role = await get_user_role(user_id)
+    if role is None:
         await reply_func("Unauthorized.")
         return
 
@@ -521,10 +653,10 @@ async def profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="Main Menu:",
-            reply_markup=get_main_menu_keyboard(user_id)
+            reply_markup=get_main_menu_keyboard(role)
         )
     else:
-        await show_main_menu(update, context, "Main Menu:")
+        await show_main_menu(update, context, user_id, "Main Menu:")
 
 # ------------------ Current Rates ------------------
 async def current_rates(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -537,7 +669,8 @@ async def current_rates(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_func = update.message.reply_text
         is_callback = False
 
-    if user_id not in (OWNER_ID, INTERMEDIARY_ID):
+    role = await get_user_role(user_id)
+    if role is None:
         await reply_func("Unauthorized.")
         return
 
@@ -567,43 +700,65 @@ async def current_rates(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="Main Menu:",
-            reply_markup=get_main_menu_keyboard(user_id)
+            reply_markup=get_main_menu_keyboard(role)
         )
     else:
-        await show_main_menu(update, context, "Main Menu:")
+        await show_main_menu(update, context, user_id, "Main Menu:")
 
 # ------------------ Export to CSV ------------------
 async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
-    if user_id not in (OWNER_ID, INTERMEDIARY_ID):
-        if isinstance(update, Update) and update.callback_query:
+    if update.callback_query:
+        user_id = update.callback_query.from_user.id
+        is_callback = True
+    else:
+        user_id = update.effective_user.id
+        is_callback = False
+
+    role = await get_user_role(user_id)
+    if role is None:
+        if is_callback:
             await update.callback_query.edit_message_text("Unauthorized.")
         else:
             await update.message.reply_text("Unauthorized.")
         return
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute('''SELECT id, usd_received, suggested_ghs, actual_ghs_paid,
-                        market_rate_at_time, owner_rate_at_time, intermediary_rate_at_time,
-                        date, recorded_by
-                 FROM customer_transactions ORDER BY date''')
-    rows = c.fetchall()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute('''SELECT id, usd_received, suggested_ghs, actual_ghs_paid,
+                            market_rate_at_time, owner_rate_at_time, intermediary_rate_at_time,
+                            date, recorded_by
+                     FROM customer_transactions ORDER BY date''')
+        rows = c.fetchall()
+        conn.close()
 
-    output = StringIO()
-    writer = csv.writer(output)
-    writer.writerow(['ID', 'USD Received', 'Suggested GHS', 'Actual GHS Paid',
-                     'Market Rate', 'Owner Rate', 'Intermediary Rate', 'Date', 'Recorded By'])
-    writer.writerows(rows)
-    output.seek(0)
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['ID', 'USD Received', 'Suggested GHS', 'Actual GHS Paid',
+                         'Market Rate', 'Owner Rate', 'Intermediary Rate', 'Date', 'Recorded By'])
+        writer.writerows(rows)
+        output.seek(0)
 
-    await context.bot.send_document(
-        chat_id=update.effective_chat.id,
-        document=output.getvalue().encode('utf-8'),
-        filename='transactions.csv'
-    )
-    await show_main_menu(update, context, "Main Menu:")
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=output.getvalue().encode('utf-8'),
+            filename='transactions.csv'
+        )
+    except Exception as e:
+        if is_callback:
+            await update.callback_query.edit_message_text(f"Error: {e}")
+        else:
+            await update.message.reply_text(f"Error: {e}")
+        logger.exception("Export CSV failed")
+
+    if is_callback:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Main Menu:",
+            reply_markup=get_main_menu_keyboard(role)
+        )
+    else:
+        await show_main_menu(update, context, user_id, "Main Menu:")
 
 # ------------------ List Transactions ------------------
 async def list_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -616,7 +771,8 @@ async def list_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_func = update.message.reply_text
         is_callback = False
 
-    if user_id not in (OWNER_ID, INTERMEDIARY_ID):
+    role = await get_user_role(user_id)
+    if role is None:
         await reply_func("Unauthorized.")
         return
 
@@ -643,19 +799,17 @@ async def list_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="Main Menu:",
-            reply_markup=get_main_menu_keyboard(user_id)
+            reply_markup=get_main_menu_keyboard(role)
         )
     else:
-        await show_main_menu(update, context, "Main Menu:")
+        await show_main_menu(update, context, user_id, "Main Menu:")
 
 # ------------------ Delete Transaction (Owner Only) ------------------
 async def delete_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
-    if user_id != OWNER_ID:
-        if isinstance(update, Update) and update.callback_query:
-            await update.callback_query.edit_message_text("Only owner can delete transactions.")
-        else:
-            await update.message.reply_text("Only owner can delete transactions.")
+    user_id = update.effective_user.id
+    role = await get_user_role(user_id)
+    if role != 'owner':
+        await update.message.reply_text("Only owner can delete transactions.")
         return
 
     try:
@@ -670,9 +824,9 @@ async def delete_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"Transaction {tx_id} deleted. (Inventory not restored.)")
     except (IndexError, ValueError):
         await update.message.reply_text("Usage: /deletetx <transaction_id>")
-    await show_main_menu(update, context, "Main Menu:")
+    await show_main_menu(update, context, user_id, "Main Menu:")
 
-# ------------------ Audit Log ------------------
+# ------------------ Audit Log (Owner Only) ------------------
 async def audit_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         user_id = update.callback_query.from_user.id
@@ -683,7 +837,8 @@ async def audit_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_func = update.message.reply_text
         is_callback = False
 
-    if user_id != OWNER_ID:
+    role = await get_user_role(user_id)
+    if role != 'owner':
         await reply_func("Only owner can view audit log.")
         return
 
@@ -700,8 +855,9 @@ async def audit_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             text = "Audit log (last 20 transactions):\n"
             for r in rows:
-                user = "Owner" if r[3] == OWNER_ID else "Intermediary"
-                text += f"ID {r[0]}: {r[1]} USD → {r[2]} GHS by {user} on {r[4][:19]}\n"
+                user_role = await get_user_role(r[3])
+                user_type = user_role if user_role else "Unknown"
+                text += f"ID {r[0]}: {r[1]} USD → {r[2]} GHS by {user_type} on {r[4][:19]}\n"
         await reply_func(text)
     except Exception as e:
         await reply_func(f"Error: {e}")
@@ -711,24 +867,24 @@ async def audit_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="Main Menu:",
-            reply_markup=get_main_menu_keyboard(user_id)
+            reply_markup=get_main_menu_keyboard(role)
         )
     else:
-        await show_main_menu(update, context, "Main Menu:")
+        await show_main_menu(update, context, user_id, "Main Menu:")
 
 # ------------------ Reset Database (Owner Only) ------------------
 async def reset_database(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Determine if called from callback or command
     if update.callback_query:
         user_id = update.callback_query.from_user.id
-        message = update.callback_query.message
         reply_func = update.callback_query.edit_message_text
+        is_callback = True
     else:
         user_id = update.effective_user.id
-        message = update.message
         reply_func = update.message.reply_text
+        is_callback = False
 
-    if user_id != OWNER_ID:
+    role = await get_user_role(user_id)
+    if role != 'owner':
         await reply_func("Only owner can reset the database.")
         return
 
@@ -745,65 +901,67 @@ async def reset_database(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_func(f"❌ Error: {e}")
         logger.exception("Reset database failed")
 
-    # Return to main menu
-    await show_main_menu(update, context, "Main Menu:")
+    if is_callback:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Main Menu:",
+            reply_markup=get_main_menu_keyboard(role)
+        )
+    else:
+        await show_main_menu(update, context, user_id, "Main Menu:")
 
-# ------------------ General Menu Callback Handler ------------------
+# ------------------ General Menu Callback Handler (Fallback) ------------------
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     user_id = query.from_user.id
 
-    if user_id not in (OWNER_ID, INTERMEDIARY_ID):
+    role = await get_user_role(user_id)
+    if role is None:
         await query.edit_message_text("Unauthorized.")
         return
 
-    # Map menu actions to functions (non-conversation ones)
-    if data == "menu_inventory":
-        await inventory(update, context)
-    elif data == "menu_profit":
-        await profit(update, context)
-    elif data == "menu_currentrates":
-        await current_rates(update, context)
-    elif data == "menu_export":
-        await export_csv(update, context)
-    elif data == "menu_listtx":
-        await list_transactions(update, context)
-    elif data == "menu_audit":
-        await audit_log(update, context)
-    elif data == "menu_deletetx" and user_id == OWNER_ID:
-        # For simplicity, we prompt for ID via command (or start another conversation)
+    # For buttons that are not handled by specific handlers (like delete tx prompt)
+    if data == "menu_deletetx":
         await query.edit_message_text("Use /deletetx <transaction_id> to delete.")
-    elif data == "menu_resetdb" and user_id == OWNER_ID:
-        await reset_database(update, context)
     elif data == "menu_cancel":
         await query.edit_message_text("Cancelled. Use /start to see menu again.")
     else:
-        # Should not happen (conversation starters are handled separately)
-        pass
+        # Should not happen – but just in case
+        await query.edit_message_text("This feature is under construction.")
 
-# ------------------ Main ------------------
+# ------------------ Post Init & Main ------------------
 async def post_init(application: Application) -> None:
-    """This function runs after the Application is initialized but before it starts polling."""
-    # Start the scheduler now that the event loop is running
+    """Runs after the Application is initialized but before it starts polling."""
+    # Ensure the hardcoded owner is in the users table
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (telegram_id, role) VALUES (?, 'owner')", (OWNER_ID,))
+    conn.commit()
+    conn.close()
+
+    # Start the scheduler for auto‑fetching market rate
     scheduler.add_job(fetch_market_rate, IntervalTrigger(hours=24))
     scheduler.start()
     logger.info("Scheduler started for automatic market rate fetching.")
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Exception while handling an update:", exc_info=context.error)
-
-
 def main():
-    init_db()
+    init_db()  # Creates all tables (including users and pending_users)
 
-    # Create the application with the post_init hook
     application = Application.builder().token(TOKEN).post_init(post_init).build()
 
-    # Basic commands
+    # --- Error handler ---
+    async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.error("Exception while handling an update:", exc_info=context.error)
+    application.add_error_handler(error_handler)
+
+    # --- Basic commands ---
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("fetchrate", fetch_rate_now))
+
+    # --- Approval callback handler ---
+    application.add_handler(CallbackQueryHandler(approval_callback, pattern="^(approve_|reject_)"))
 
     # --- Conversation handlers (must come before general callback) ---
     # Set market conversation
@@ -815,7 +973,8 @@ def main():
         states={
             SET_MARKET_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, setmarket_rate)]
         },
-        fallbacks=[CallbackQueryHandler(menu_callback, pattern="^menu_cancel$")]
+        fallbacks=[CallbackQueryHandler(menu_callback, pattern="^menu_cancel$")],
+        per_message=False
     )
     application.add_handler(setmarket_conv)
 
@@ -829,7 +988,8 @@ def main():
             "BULK_USD": [MessageHandler(filters.TEXT & ~filters.COMMAND, bulk_usd)],
             "BULK_RATE": [MessageHandler(filters.TEXT & ~filters.COMMAND, bulk_rate)],
         },
-        fallbacks=[CallbackQueryHandler(menu_callback, pattern="^menu_cancel$")]
+        fallbacks=[CallbackQueryHandler(menu_callback, pattern="^menu_cancel$")],
+        per_message=False
     )
     application.add_handler(bulk_conv)
 
@@ -844,7 +1004,8 @@ def main():
             CONFIRM_SUGGESTION: [CallbackQueryHandler(pay_confirm)],
             ACTUAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, pay_actual)],
         },
-        fallbacks=[CallbackQueryHandler(menu_callback, pattern="^menu_cancel$")]
+        fallbacks=[CallbackQueryHandler(menu_callback, pattern="^menu_cancel$")],
+        per_message=False
     )
     application.add_handler(pay_conv)
 
@@ -855,13 +1016,12 @@ def main():
     application.add_handler(CallbackQueryHandler(export_csv, pattern="^menu_export$"))
     application.add_handler(CallbackQueryHandler(list_transactions, pattern="^menu_listtx$"))
     application.add_handler(CallbackQueryHandler(audit_log, pattern="^menu_audit$"))
-    # Owner-only menu actions
     application.add_handler(CallbackQueryHandler(reset_database, pattern="^menu_resetdb$"))
-    # Delete transaction uses command, not menu callback
+    # Delete transaction and cancel use a generic handler
     application.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_deletetx$"))
     application.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_cancel$"))
 
-    # Additional command handlers
+    # --- Additional command handlers ---
     application.add_handler(CommandHandler("profit", profit))
     application.add_handler(CommandHandler("inventory", inventory))
     application.add_handler(CommandHandler("export", export_csv))
@@ -869,9 +1029,7 @@ def main():
     application.add_handler(CommandHandler("deletetx", delete_transaction))
     application.add_handler(CommandHandler("audit", audit_log))
     application.add_handler(CommandHandler("resetdb", reset_database))
-    application.add_error_handler(error_handler)
 
-    # Start the bot (this starts the event loop)
     application.run_polling()
 
 if __name__ == '__main__':

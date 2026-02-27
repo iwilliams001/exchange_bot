@@ -8,7 +8,7 @@ import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -130,17 +130,25 @@ def get_main_menu_keyboard(role: str):
 
     return InlineKeyboardMarkup(keyboard)
 
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, text="Main Menu:"):
-    """Send or edit a message with the main menu."""
+async def show_main_menu(update_or_obj, context: ContextTypes.DEFAULT_TYPE, user_id: int, text="Main Menu:"):
+    """
+    Send or edit a message with the main menu.
+    update_or_obj can be an Update (from command) or a CallbackQuery (from button).
+    """
     role = await get_user_role(user_id)
     if role is None:
-        # This should not happen if called for approved users
         return
     keyboard = get_main_menu_keyboard(role)
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=keyboard)
+
+    # Case 1: It's an Update with a callback_query (menu button click)
+    if isinstance(update_or_obj, Update) and update_or_obj.callback_query:
+        await update_or_obj.callback_query.edit_message_text(text, reply_markup=keyboard)
+    # Case 2: It's a CallbackQuery directly (e.g., after finishing a conversation)
+    elif isinstance(update_or_obj, CallbackQuery):
+        await update_or_obj.edit_message_text(text, reply_markup=keyboard)
+    # Case 3: It's an Update without callback (e.g., command)
     else:
-        await update.message.reply_text(text, reply_markup=keyboard)
+        await update_or_obj.message.reply_text(text, reply_markup=keyboard)
 
 # ------------------ Start Command & Approval Flow ------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):

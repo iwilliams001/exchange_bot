@@ -403,49 +403,65 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
 
 # ------------------ Inventory Check ------------------
 async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
+    # Determine caller type
+    if update.callback_query:
+        user_id = update.callback_query.from_user.id
+        message = update.callback_query.message
+        reply_func = update.callback_query.edit_message_text
+        is_callback = True
+    else:
+        user_id = update.effective_user.id
+        message = update.message
+        reply_func = update.message.reply_text
+        is_callback = False
+
     if user_id not in (OWNER_ID, INTERMEDIARY_ID):
-        if isinstance(update, Update) and update.callback_query:
-            await update.callback_query.edit_message_text("Unauthorized.")
-        else:
-            await update.message.reply_text("Unauthorized.")
+        await reply_func("Unauthorized.")
         return
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT SUM(remaining_ghs) FROM inventory_batches")
-    total_ghs = c.fetchone()[0] or 0.0
-    c.execute("SELECT remaining_ghs, usd_cost_per_ghs FROM inventory_batches WHERE remaining_ghs > 0")
-    rows = c.fetchall()
-    total_value_usd = sum(r[0] * r[1] for r in rows)
-    avg_ghs_per_usd = total_ghs / total_value_usd if total_value_usd > 0 else 0
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("SELECT SUM(remaining_ghs) FROM inventory_batches")
+        total_ghs = c.fetchone()[0] or 0.0
+        c.execute("SELECT remaining_ghs, usd_cost_per_ghs FROM inventory_batches WHERE remaining_ghs > 0")
+        rows = c.fetchall()
+        total_value_usd = sum(r[0] * r[1] for r in rows)
+        avg_ghs_per_usd = total_ghs / total_value_usd if total_value_usd > 0 else 0
+        conn.close()
+        text = (
+            f"📦 GHS balance: {total_ghs:.2f}\n"
+            f"Average rate: {avg_ghs_per_usd:.4f} GHS/USD\n"
+            f"Total value: ${total_value_usd:.2f}"
+        )
+        await reply_func(text)
+    except Exception as e:
+        await reply_func(f"Error: {e}")
+        logger.exception("Inventory failed")
 
-    text = (
-        f"📦 GHS balance: {total_ghs:.2f}\n"
-        f"Average rate: {avg_ghs_per_usd:.4f} GHS/USD\n"
-        f"Total value: ${total_value_usd:.2f}"
-    )
-
-    if isinstance(update, Update) and update.callback_query:
-        await update.callback_query.edit_message_text(text)
+    # Return to main menu
+    if is_callback:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="Main Menu:",
             reply_markup=get_main_menu_keyboard(user_id)
         )
     else:
-        await update.message.reply_text(text)
         await show_main_menu(update, context, "Main Menu:")
 
 # ------------------ Profit with Date Range ------------------
 async def profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
+    if update.callback_query:
+        user_id = update.callback_query.from_user.id
+        reply_func = update.callback_query.edit_message_text
+        is_callback = True
+    else:
+        user_id = update.effective_user.id
+        reply_func = update.message.reply_text
+        is_callback = False
+
     if user_id not in (OWNER_ID, INTERMEDIARY_ID):
-        if isinstance(update, Update) and update.callback_query:
-            await update.callback_query.edit_message_text("Unauthorized.")
-        else:
-            await update.message.reply_text("Unauthorized.")
+        await reply_func("Unauthorized.")
         return
 
     # Parse optional date arguments
@@ -460,90 +476,100 @@ async def profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 start_date = context.args[0]
                 end_date = start_date
         except:
-            await update.message.reply_text("Usage: /profit [YYYY-MM-DD] [YYYY-MM-DD]")
+            await reply_func("Usage: /profit [YYYY-MM-DD] [YYYY-MM-DD]")
             return
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
 
-    # Owner profit query
-    owner_query = '''
-        SELECT SUM(t.usd_received - ub.total_cost)
-        FROM customer_transactions t
-        JOIN (
-            SELECT tx_id, SUM(ghs_used * b.usd_cost_per_ghs) as total_cost
-            FROM tx_batch_usage u
-            JOIN inventory_batches b ON u.batch_id = b.id
-            GROUP BY tx_id
-        ) ub ON t.id = ub.tx_id
-    '''
-    inter_query = 'SELECT SUM(usd_received * market_rate_at_time - actual_ghs_paid) FROM customer_transactions'
-    params = []
-    if start_date and end_date:
-        where_clause = " WHERE date BETWEEN ? AND ?"
-        owner_query += where_clause
-        inter_query += where_clause
-        params = [f"{start_date} 00:00:00", f"{end_date} 23:59:59"]
+        owner_query = '''
+            SELECT SUM(t.usd_received - ub.total_cost)
+            FROM customer_transactions t
+            JOIN (
+                SELECT tx_id, SUM(ghs_used * b.usd_cost_per_ghs) as total_cost
+                FROM tx_batch_usage u
+                JOIN inventory_batches b ON u.batch_id = b.id
+                GROUP BY tx_id
+            ) ub ON t.id = ub.tx_id
+        '''
+        inter_query = 'SELECT SUM(usd_received * market_rate_at_time - actual_ghs_paid) FROM customer_transactions'
+        params = []
+        if start_date and end_date:
+            where = " WHERE date BETWEEN ? AND ?"
+            owner_query += where
+            inter_query += where
+            params = [f"{start_date} 00:00:00", f"{end_date} 23:59:59"]
 
-    c.execute(owner_query, params)
-    owner_profit_usd = c.fetchone()[0] or 0.0
-    c.execute(inter_query, params)
-    inter_profit_ghs = c.fetchone()[0] or 0.0
-    conn.close()
+        c.execute(owner_query, params)
+        owner_profit_usd = c.fetchone()[0] or 0.0
+        c.execute(inter_query, params)
+        inter_profit_ghs = c.fetchone()[0] or 0.0
+        conn.close()
 
-    date_str = f" from {start_date} to {end_date}" if start_date else ""
-    text = (
-        f"💰 Owner profit{date_str}: ${owner_profit_usd:.2f}\n"
-        f"💸 Intermediary profit{date_str}: {inter_profit_ghs:.2f} GHS"
-    )
+        date_str = f" from {start_date} to {end_date}" if start_date else ""
+        text = (
+            f"💰 Owner profit{date_str}: ${owner_profit_usd:.2f}\n"
+            f"💸 Intermediary profit{date_str}: {inter_profit_ghs:.2f} GHS"
+        )
+        await reply_func(text, parse_mode='Markdown')
+    except Exception as e:
+        await reply_func(f"Error: {e}")
+        logger.exception("Profit failed")
 
-    if isinstance(update, Update) and update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode='Markdown')
+    if is_callback:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="Main Menu:",
             reply_markup=get_main_menu_keyboard(user_id)
         )
     else:
-        await update.message.reply_text(text, parse_mode='Markdown')
         await show_main_menu(update, context, "Main Menu:")
 
 # ------------------ Current Rates ------------------
 async def current_rates(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
+    if update.callback_query:
+        user_id = update.callback_query.from_user.id
+        reply_func = update.callback_query.edit_message_text
+        is_callback = True
+    else:
+        user_id = update.effective_user.id
+        reply_func = update.message.reply_text
+        is_callback = False
+
     if user_id not in (OWNER_ID, INTERMEDIARY_ID):
-        if isinstance(update, Update) and update.callback_query:
-            await update.callback_query.edit_message_text("Unauthorized.")
-        else:
-            await update.message.reply_text("Unauthorized.")
+        await reply_func("Unauthorized.")
         return
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT rate, timestamp FROM market_rates ORDER BY timestamp DESC LIMIT 1")
-    row = c.fetchone()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("SELECT rate, timestamp FROM market_rates ORDER BY timestamp DESC LIMIT 1")
+        row = c.fetchone()
+        conn.close()
 
-    if not row:
-        text = "No market rate set yet."
-    else:
-        market, ts = row
-        owner = owner_rate(market)
-        inter = intermediary_rate(market)
-        text = (f"📊 **Current Rates**\n"
-                f"Market: {market:.4f} GHS/USD (as of {ts[:10]})\n"
-                f"Owner rate: {owner:.4f} GHS/USD\n"
-                f"Intermediary rate: {inter:.4f} GHS/USD")
+        if not row:
+            text = "No market rate set yet."
+        else:
+            market, ts = row
+            owner = owner_rate(market)
+            inter = intermediary_rate(market)
+            text = (f"📊 **Current Rates**\n"
+                    f"Market: {market:.4f} GHS/USD (as of {ts[:10]})\n"
+                    f"Owner rate: {owner:.4f} GHS/USD\n"
+                    f"Intermediary rate: {inter:.4f} GHS/USD")
+        await reply_func(text, parse_mode='Markdown')
+    except Exception as e:
+        await reply_func(f"Error: {e}")
+        logger.exception("Current rates failed")
 
-    if isinstance(update, Update) and update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode='Markdown')
+    if is_callback:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="Main Menu:",
             reply_markup=get_main_menu_keyboard(user_id)
         )
     else:
-        await update.message.reply_text(text, parse_mode='Markdown')
         await show_main_menu(update, context, "Main Menu:")
 
 # ------------------ Export to CSV ------------------
@@ -581,37 +607,45 @@ async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------ List Transactions ------------------
 async def list_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
+    if update.callback_query:
+        user_id = update.callback_query.from_user.id
+        reply_func = update.callback_query.edit_message_text
+        is_callback = True
+    else:
+        user_id = update.effective_user.id
+        reply_func = update.message.reply_text
+        is_callback = False
+
     if user_id not in (OWNER_ID, INTERMEDIARY_ID):
-        if isinstance(update, Update) and update.callback_query:
-            await update.callback_query.edit_message_text("Unauthorized.")
-        else:
-            await update.message.reply_text("Unauthorized.")
+        await reply_func("Unauthorized.")
         return
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute('''SELECT id, usd_received, actual_ghs_paid, date
-                 FROM customer_transactions ORDER BY date DESC LIMIT 10''')
-    rows = c.fetchall()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute('''SELECT id, usd_received, actual_ghs_paid, date
+                     FROM customer_transactions ORDER BY date DESC LIMIT 10''')
+        rows = c.fetchall()
+        conn.close()
 
-    if not rows:
-        text = "No transactions yet."
-    else:
-        text = "Recent transactions:\n"
-        for r in rows:
-            text += f"ID {r[0]}: {r[1]} USD → {r[2]} GHS on {r[3][:10]}\n"
+        if not rows:
+            text = "No transactions yet."
+        else:
+            text = "Recent transactions:\n"
+            for r in rows:
+                text += f"ID {r[0]}: {r[1]} USD → {r[2]} GHS on {r[3][:10]}\n"
+        await reply_func(text)
+    except Exception as e:
+        await reply_func(f"Error: {e}")
+        logger.exception("List transactions failed")
 
-    if isinstance(update, Update) and update.callback_query:
-        await update.callback_query.edit_message_text(text)
+    if is_callback:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="Main Menu:",
             reply_markup=get_main_menu_keyboard(user_id)
         )
     else:
-        await update.message.reply_text(text)
         await show_main_menu(update, context, "Main Menu:")
 
 # ------------------ Delete Transaction (Owner Only) ------------------
@@ -640,38 +674,46 @@ async def delete_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ------------------ Audit Log ------------------
 async def audit_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if isinstance(update, Update) else update.callback_query.from_user.id
+    if update.callback_query:
+        user_id = update.callback_query.from_user.id
+        reply_func = update.callback_query.edit_message_text
+        is_callback = True
+    else:
+        user_id = update.effective_user.id
+        reply_func = update.message.reply_text
+        is_callback = False
+
     if user_id != OWNER_ID:
-        if isinstance(update, Update) and update.callback_query:
-            await update.callback_query.edit_message_text("Only owner can view audit log.")
-        else:
-            await update.message.reply_text("Only owner can view audit log.")
+        await reply_func("Only owner can view audit log.")
         return
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute('''SELECT id, usd_received, actual_ghs_paid, recorded_by, date
-                 FROM customer_transactions ORDER BY date DESC LIMIT 20''')
-    rows = c.fetchall()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute('''SELECT id, usd_received, actual_ghs_paid, recorded_by, date
+                     FROM customer_transactions ORDER BY date DESC LIMIT 20''')
+        rows = c.fetchall()
+        conn.close()
 
-    if not rows:
-        text = "No transactions yet."
-    else:
-        text = "Audit log (last 20 transactions):\n"
-        for r in rows:
-            user = "Owner" if r[3] == OWNER_ID else "Intermediary"
-            text += f"ID {r[0]}: {r[1]} USD → {r[2]} GHS by {user} on {r[4][:19]}\n"
+        if not rows:
+            text = "No transactions yet."
+        else:
+            text = "Audit log (last 20 transactions):\n"
+            for r in rows:
+                user = "Owner" if r[3] == OWNER_ID else "Intermediary"
+                text += f"ID {r[0]}: {r[1]} USD → {r[2]} GHS by {user} on {r[4][:19]}\n"
+        await reply_func(text)
+    except Exception as e:
+        await reply_func(f"Error: {e}")
+        logger.exception("Audit log failed")
 
-    if isinstance(update, Update) and update.callback_query:
-        await update.callback_query.edit_message_text(text)
+    if is_callback:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="Main Menu:",
             reply_markup=get_main_menu_keyboard(user_id)
         )
     else:
-        await update.message.reply_text(text)
         await show_main_menu(update, context, "Main Menu:")
 
 # ------------------ Reset Database (Owner Only) ------------------
@@ -749,6 +791,10 @@ async def post_init(application: Application) -> None:
     scheduler.start()
     logger.info("Scheduler started for automatic market rate fetching.")
 
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Exception while handling an update:", exc_info=context.error)
+
+
 def main():
     init_db()
 
@@ -823,6 +869,7 @@ def main():
     application.add_handler(CommandHandler("deletetx", delete_transaction))
     application.add_handler(CommandHandler("audit", audit_log))
     application.add_handler(CommandHandler("resetdb", reset_database))
+    application.add_error_handler(error_handler)
 
     # Start the bot (this starts the event loop)
     application.run_polling()

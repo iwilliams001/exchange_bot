@@ -408,14 +408,14 @@ async def pay_usd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['intermediary_rate'] = inter
         context.user_data['suggested'] = suggested
         keyboard = [
-            [InlineKeyboardButton("✅ Use suggested", callback_data='use_suggested'),
-             InlineKeyboardButton("✏️ Enter different", callback_data='enter_different')],
+            [InlineKeyboardButton(f"✅ Pay {suggested:.2f}", callback_data='use_suggested'),
+             InlineKeyboardButton("✏️ Enter different amount", callback_data='enter_different')],
             [InlineKeyboardButton("❌ Cancel", callback_data='cancel_transaction')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
-            f"Suggested GHS amount (using intermediary's rate): {suggested:.2f}\n"
-            f"Owner rate: {owner:.4f} GHS/USD | Intermediary rate: {inter:.4f} GHS/USD\n"
+            f"Suggested GHS amount: {suggested:.2f}\n"
+            f"Owner rate: {owner:.1f} | Intermediary rate: {inter:.1f}\n"
             "What do you want to do?",
             reply_markup=reply_markup
         )

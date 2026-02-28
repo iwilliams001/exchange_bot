@@ -23,11 +23,12 @@ def intermediary_rate(market):
     else:
         return floored
 
-def deduct_from_inventory(ghs_needed):
-    """
-    Deduct GHS from oldest batches (FIFO) and return usage list and total USD cost.
-    """
-    conn = sqlite3.connect(DB_NAME)
+def deduct_from_inventory(ghs_needed, conn=None):
+    """Deduct GHS using FIFO. If conn is provided, use it (no commit). Otherwise open own connection and commit."""
+    close_conn = False
+    if conn is None:
+        conn = sqlite3.connect(DB_NAME)
+        close_conn = True
     c = conn.cursor()
     c.execute("SELECT id, remaining_ghs, usd_cost_per_ghs FROM inventory_batches WHERE remaining_ghs > 0 ORDER BY id")
     batches = c.fetchall()
@@ -42,8 +43,9 @@ def deduct_from_inventory(ghs_needed):
         total_cost_usd += take * cost
         remaining -= take
         c.execute("UPDATE inventory_batches SET remaining_ghs = remaining_ghs - ? WHERE id = ?", (take, batch_id))
-    conn.commit()
-    conn.close()
     if remaining > 0:
         raise Exception("Insufficient GHS in inventory")
+    if close_conn:
+        conn.commit()
+        conn.close()
     return usage, total_cost_usd

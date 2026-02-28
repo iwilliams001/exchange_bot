@@ -529,72 +529,55 @@ async def finalize_transaction(update_or_query, context: ContextTypes.DEFAULT_TY
     owner = context.user_data['owner_rate']
     inter = context.user_data['intermediary_rate']
 
-    owner_share = usd * owner  # GHS to be deducted from inventory (owner's cost)
-
-    # Prevent intermediary from overpaying beyond owner's share
-    if actual > owner_share:
-        await message.reply_text(
-            f"❌ Amount exceeds owner's share ({owner_share:.2f} GHS).\n"
-            "To avoid a loss, you cannot pay more than the owner's share.\n"
-            "Please enter a lower amount or negotiate with the customer."
-        )
-        await show_main_menu(update_or_query, context, user_id, "Main Menu:")
-        return ConversationHandler.END
+    owner_share = usd * owner
 
     conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT SUM(remaining_ghs) FROM inventory_batches")
-    total_ghs = c.fetchone()[0] or 0.0
-
-    # Check inventory against owner_share (not actual)
-    if total_ghs < owner_share:
-        await message.reply_text(
-            f"Insufficient GHS to cover owner's share!\n"
-            f"Available: {total_ghs:.2f} GHS, needed: {owner_share:.2f} GHS.\n"
-            f"Please top up inventory and try again."
-        )
-        await show_main_menu(update_or_query, context, user_id, "Main Menu:")
-        return ConversationHandler.END
-
-    # Deduct owner_share from inventory (FIFO)
     try:
-        usage, total_cost_usd = deduct_from_inventory(owner_share)  # now deducts owner_share
+        c = conn.cursor()
+        c.execute("SELECT SUM(remaining_ghs) FROM inventory_batches")
+        total_ghs = c.fetchone()[0] or 0.0
+
+        if total_ghs < owner_share:
+            await message.reply_text(
+                f"Insufficient GHS! Available: {total_ghs:.2f}, needed: {owner_share:.2f}. Top up inventory.")
+            await show_main_menu(update_or_query, context, user_id, "Main Menu:")
+            return ConversationHandler.END
+
+        # Deduct using the same connection (no commit inside)
+        usage, total_cost_usd = deduct_from_inventory(owner_share, conn)
+
+        owner_profit_usd = usd - total_cost_usd
+        if owner_profit_usd < 0:
+            await message.reply_text("Critical error: owner profit negative. Transaction cancelled.")
+            conn.rollback()
+            await show_main_menu(update_or_query, context, user_id, "Main Menu:")
+            return ConversationHandler.END
+
+        # Insert transaction
+        c.execute('''INSERT INTO customer_transactions
+                         (usd_received, suggested_ghs, actual_ghs_paid, market_rate_at_time,
+                          owner_rate_at_time, intermediary_rate_at_time, date, recorded_by, owner_profit_usd)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                  (usd, suggested, actual, market, owner, inter,
+                   datetime.now().isoformat(), user_id, owner_profit_usd))
+        tx_id = c.lastrowid
+
+        # Insert batch usage
+        for batch_id, ghs_used, cost in usage:
+            c.execute("INSERT INTO tx_batch_usage (tx_id, batch_id, ghs_used) VALUES (?, ?, ?)",
+                      (tx_id, batch_id, ghs_used))
+
+        conn.commit()
+        remaining = total_ghs - owner_share  # this is the new total after deduction
+
     except Exception as e:
-        await message.reply_text(str(e))
+        conn.rollback()
+        await message.reply_text(f"Error: {e}")
+        logger.exception("Transaction failed")
         await show_main_menu(update_or_query, context, user_id, "Main Menu:")
         return ConversationHandler.END
-
-    # Owner profit based on cost of owner_share
-    owner_profit_usd = usd - total_cost_usd
-    if owner_profit_usd < 0:
-        await message.reply_text(
-            f"Critical error: owner profit negative (${owner_profit_usd:.2f}). "
-            "Transaction cancelled. Contact support."
-        )
-        # In production, you might want to rollback the inventory deduction here.
-        await show_main_menu(update_or_query, context, user_id, "Main Menu:")
-        return ConversationHandler.END
-
-    # Record transaction (store owner_share as well? Not necessary, but we have owner_rate)
-    c = conn.cursor()
-    c.execute('''INSERT INTO customer_transactions
-                 (usd_received, suggested_ghs, actual_ghs_paid, market_rate_at_time,
-                  owner_rate_at_time, intermediary_rate_at_time, date, recorded_by,
-                  owner_profit_usd)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-              (usd, suggested, actual, market, owner, inter,
-               datetime.now().isoformat(), user_id, owner_profit_usd))
-    tx_id = c.lastrowid
-
-    # Record batch usage (for owner_share deduction)
-    for batch_id, ghs_used, cost in usage:
-        c.execute("INSERT INTO tx_batch_usage (tx_id, batch_id, ghs_used) VALUES (?, ?, ?)",
-                  (tx_id, batch_id, ghs_used))
-
-    conn.commit()
-    conn.close()
-
-    remaining = total_ghs - owner_share  # remaining after deducting owner's share
+    finally:
+        conn.close()
 
     # Message for the user who performed the transaction (intermediary or owner)
     # Do NOT include owner profit
